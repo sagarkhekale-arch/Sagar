@@ -44,12 +44,18 @@ _APP_THEME_CSS = """
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-/* Hide Streamlit's native top-right header (System/Light/Dark picker & deploy menu)
-   so only our sidebar toggle controls the theme — prevents the two from fighting. */
-header[data-testid="stHeader"],
-[data-testid="stToolbar"],
-[data-testid="stDecoration"],
+/* Hide ONLY the right-side action buttons (deploy, settings, share).
+   Do NOT hide stToolbar or stHeader — the sidebar toggle lives inside them. */
+[data-testid="stDecoration"] { display: none !important; }
 #MainMenu { display: none !important; }
+/* Hide the toolbar action buttons on the right (theme picker, deploy, etc.)
+   without touching the sidebar collapse/expand arrow on the left. */
+[data-testid="stToolbarActions"] { display: none !important; }
+/* Make header background transparent so it blends in */
+header[data-testid="stHeader"] {
+    background-color: transparent !important;
+    box-shadow: none !important;
+}
 :root {
   --pnl-bg: #f1f5f9;
   --pnl-surface: #ffffff;
