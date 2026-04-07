@@ -1,0 +1,16 @@
+[theme]
+# Fixed base = "light" so Streamlit's internal [data-theme] never flips.
+# Our app-level toggle (🌙 / ☀️) handles both dark and light via CSS override.
+base = "light"
+primaryColor        = "#6366f1"
+backgroundColor     = "#f1f5f9"
+secondaryBackgroundColor = "#ffffff"
+textColor           = "#0f172a"
+font                = "sans serif"
+
+[server]
+headless = true
+enableCORS = false
+
+[browser]
+gatherUsageStats = false
