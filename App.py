@@ -44,13 +44,12 @@ _APP_THEME_CSS = """
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-/* Hide the deploy/settings toolbar and decoration bar only.
-   We deliberately do NOT touch the header itself or any button inside it
-   so the sidebar collapse/expand arrow always works. */
-[data-testid="stToolbar"] { display: none !important; }
+/* Hide only the right-side action buttons and decoration.
+   stToolbar and stHeader are intentionally left alone so the
+   sidebar collapse/expand arrow is always visible and clickable. */
+[data-testid="stToolbarActions"] { display: none !important; }
 [data-testid="stDecoration"] { display: none !important; }
 #MainMenu { display: none !important; }
-/* Make header blend into the page background — zero visual footprint */
 header[data-testid="stHeader"] {
     background-color: transparent !important;
     box-shadow: none !important;
@@ -1525,7 +1524,7 @@ def _github_push_app_files(token: str, repo: str, branch: str) -> List[dict]:
 _LOGIN_SCREEN_CSS = """
 <style>
 section[data-testid="stSidebar"] { display: none !important; }
-header[data-testid="stHeader"] { display: none !important; }
+[data-testid="stToolbarActions"] { display: none !important; }
 .stApp {
     background: #0f0f12 !important;
 }
