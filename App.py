@@ -1476,13 +1476,14 @@ def _github_push_app_files(token: str, repo: str, branch: str) -> List[dict]:
 _LOGIN_SCREEN_CSS = """
 <style>
 section[data-testid="stSidebar"] { display: none !important; }
-button[kind="header"] { display: none !important; }
+header[data-testid="stHeader"] { display: none !important; }
 .stApp {
     background: #0f0f12 !important;
 }
 section[data-testid="stMain"] > div {
     background: #0f0f12 !important;
 }
+/* Card container */
 div[data-testid="column"] > div {
     background: #1e1e2a !important;
     border-radius: 28px !important;
@@ -1490,38 +1491,69 @@ div[data-testid="column"] > div {
     border: 1px solid #3a3a44 !important;
     box-shadow: 0 8px 20px rgba(0,0,0,0.5) !important;
 }
+/* Title */
 section[data-testid="stMain"] h1,
 section[data-testid="stMain"] h2,
 section[data-testid="stMain"] h3 {
     color: #f8fafc !important;
     text-align: center !important;
 }
+/* All body text — paragraphs, captions, markdowns */
+section[data-testid="stMain"] p,
+section[data-testid="stMain"] span,
+section[data-testid="stMain"] label,
+section[data-testid="stMain"] [data-testid="stMarkdownContainer"] p,
+section[data-testid="stMain"] [data-testid="stCaption"] p {
+    color: #cbd5e1 !important;
+}
+/* Input labels */
 section[data-testid="stMain"] .stTextInput label,
 section[data-testid="stMain"] .stTextInput [data-testid="stWidgetLabel"] p {
-    color: #cbd5e1 !important;
+    color: #94a3b8 !important;
     font-weight: 500 !important;
 }
+/* Input boxes */
+section[data-testid="stMain"] .stTextInput input {
+    background: #2d2d3d !important;
+    color: #f1f5f9 !important;
+    border: 1px solid #3f3f55 !important;
+    border-radius: 10px !important;
+}
+section[data-testid="stMain"] .stTextInput input::placeholder {
+    color: #64748b !important;
+}
+/* Login button */
 section[data-testid="stMain"] button[kind="primary"] {
-    background: #4f46e5 !important;
+    background: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%) !important;
     border-radius: 40px !important;
     font-weight: 600 !important;
+    color: #fff !important;
     width: 100% !important;
+    border: none !important;
 }
+section[data-testid="stMain"] button[kind="primary"] p {
+    color: #fff !important;
+}
+/* Secondary button */
 section[data-testid="stMain"] button[kind="secondary"] {
     background: transparent !important;
     border: 1px solid #4f46e5 !important;
     color: #cbd5e1 !important;
     border-radius: 40px !important;
 }
-section[data-testid="stMain"] .stCheckbox label span {
-    color: #e2e8f0 !important;
-}
+/* Toggle / checkbox */
+section[data-testid="stMain"] .stCheckbox label span,
 section[data-testid="stMain"] .stToggle label p,
 section[data-testid="stMain"] .stToggle label span {
     color: #e2e8f0 !important;
 }
+/* Alerts */
 section[data-testid="stMain"] div[data-testid="stAlert"] {
     border-radius: 16px !important;
+}
+/* Divider */
+section[data-testid="stMain"] hr {
+    border-color: #3a3a44 !important;
 }
 </style>
 """
@@ -5106,7 +5138,7 @@ if not st.session_state.auth_ok:
         )
         sign_up_mode = st.toggle("New account? Sign up", key="signup_toggle")
         if not sign_up_mode:
-            user_id = st.text_input("User ID", placeholder="e.g., Admin@123")
+            user_id = st.text_input("User ID", placeholder="Enter your user ID")
             password = st.text_input("Password", type="password", placeholder="••••••")
             if st.button("Login", type="primary", use_container_width=True, key="login_submit"):
                 ok, msg = _auth_try_login(user_id, password)
@@ -5121,7 +5153,6 @@ if not st.session_state.auth_ok:
                     st.rerun()
                 else:
                     st.error(msg)
-            st.caption("Default admin: `Admin@123` / `Admin@1234`")
         else:
             new_id = st.text_input("Choose a user ID", placeholder="e.g., john_doe")
             new_pw = st.text_input("Choose a password", type="password", placeholder="••••••")
@@ -5134,8 +5165,6 @@ if not st.session_state.auth_ok:
                     st.rerun()
                 else:
                     st.error(msg)
-        st.divider()
-        st.caption("Credentials are stored locally in `app_auth_credentials.json`")
     st.stop()
 
 st.markdown(_PNL_FULL_SITE_CSS, unsafe_allow_html=True)
