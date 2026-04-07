@@ -1287,6 +1287,55 @@ def render_admin_panel() -> None:
 
     st.divider()
 
+    # ── Credentials Backup / Restore ──────────────────────────────────────────
+    st.subheader("💾  Backup & Restore credentials")
+    st.caption(
+        "User accounts, API keys, and GitHub settings are stored in `app_auth_credentials.json` "
+        "which is **not** pushed to GitHub. Use Export before pushing, and Import after pulling on a new machine."
+    )
+    _cred_path = _auth_credentials_path()
+    col_exp, col_imp = st.columns(2)
+
+    with col_exp:
+        st.markdown("**📤 Export**")
+        if os.path.isfile(_cred_path):
+            with open(_cred_path, "rb") as _cf:
+                st.download_button(
+                    "Download credentials file",
+                    data=_cf.read(),
+                    file_name="app_auth_credentials.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    key="admin_export_creds_btn",
+                )
+            st.caption("Save this file somewhere safe. Never commit it to GitHub.")
+        else:
+            st.info("No credentials file found yet.")
+
+    with col_imp:
+        st.markdown("**📥 Import**")
+        _uploaded_creds = st.file_uploader(
+            "Upload credentials file",
+            type=["json"],
+            key="admin_import_creds_upload",
+            label_visibility="collapsed",
+        )
+        if _uploaded_creds is not None:
+            try:
+                _import_data = json.loads(_uploaded_creds.read().decode("utf-8"))
+                if not isinstance(_import_data, dict):
+                    st.error("Invalid file format.")
+                else:
+                    if st.button("✅  Confirm import", key="admin_import_creds_confirm", type="primary", use_container_width=True):
+                        with open(_cred_path, "w", encoding="utf-8") as _wf:
+                            json.dump(_import_data, _wf, indent=2)
+                        st.success("Credentials restored. Reload the page to apply.")
+                        st.rerun()
+            except Exception as _ie:
+                st.error(f"Could not read file: {_ie}")
+
+    st.divider()
+
     # ── GitHub Push ───────────────────────────────────────────────────────────
     st.subheader("🐙  Push to GitHub")
     st.caption(
