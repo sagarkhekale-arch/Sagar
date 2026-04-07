@@ -18,11 +18,22 @@ import html
 from datetime import date, timedelta
 from urllib import request as urlrequest
 from urllib.error import URLError, HTTPError
+import base64
+import urllib.parse
 
 try:
     import google.generativeai as genai
 except Exception:
     genai = None
+
+try:
+    from googleapiclient.discovery import build as _gdrive_build
+    from googleapiclient.errors import HttpError as _GDriveHttpError
+    _GDRIVE_OK = True
+except Exception:
+    _gdrive_build = None  # type: ignore
+    _GDriveHttpError = Exception
+    _GDRIVE_OK = False
 
 # --- Configuration ---
 st.set_page_config(page_title="Operation Dashboard", page_icon="📊", layout="wide")
@@ -33,6 +44,12 @@ _APP_THEME_CSS = """
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
+/* Hide Streamlit's native top-right header (System/Light/Dark picker & deploy menu)
+   so only our sidebar toggle controls the theme — prevents the two from fighting. */
+header[data-testid="stHeader"],
+[data-testid="stToolbar"],
+[data-testid="stDecoration"],
+#MainMenu { display: none !important; }
 :root {
   --pnl-bg: #f1f5f9;
   --pnl-surface: #ffffff;
@@ -397,15 +414,27 @@ _APP_THEME_DARK_CSS = """
 
 
 def _render_app_hero(main_view_label: str) -> None:
-    """Branded header strip; main_view_label is Dashboard / PNL / AI Chat."""
-    _labels = {"Dashboard": "Dashboard", "PNL": "PNL", "AI Chat": "AI Chat"}
-    safe = _labels.get(main_view_label, main_view_label)
+    """Branded header strip — title, badge, and sub-text change per page."""
     if main_view_label == "PNL":
         hero_title = "PNL Dashboard"
-        hero_badge = "P&amp;L workspace"
+        hero_badge = "P&amp;L Workspace"
         hero_sub = (
             "Load data from the sidebar (same <strong>Select Database Type</strong> as everywhere else), "
             "then build your P&amp;L view here."
+        )
+    elif main_view_label == "AI Chat":
+        hero_title = "AI Assistant"
+        hero_badge = "Conversational Analyst"
+        hero_sub = (
+            "Ask questions about your loaded data in plain English. "
+            "Use <strong>sql:</strong> prefix to run DuckDB queries directly on the table."
+        )
+    elif main_view_label == "Admin":
+        hero_title = "Admin Panel"
+        hero_badge = "User Management"
+        hero_sub = (
+            "Create and manage user accounts, assign roles (<strong>admin</strong> / <strong>user</strong>), "
+            "and control which pages each user can access."
         )
     else:
         hero_title = "Operation Dashboard"
@@ -414,14 +443,13 @@ def _render_app_hero(main_view_label: str) -> None:
             "Connect a data source in the sidebar, then switch between PNL analytics, an operations view, "
             "and a conversational analyst — all on one workspace."
         )
+    safe = html.escape(main_view_label)
     st.markdown(
         f"""
         <div class="app-hero">
           <span class="app-hero-badge">{hero_badge}</span>
           <h1 class="app-hero-title">{hero_title}</h1>
-          <p class="app-hero-sub">
-            {hero_sub}
-          </p>
+          <p class="app-hero-sub">{hero_sub}</p>
           <div class="app-hero-view">● Viewing: <strong>{safe}</strong></div>
         </div>
         """,
@@ -737,26 +765,194 @@ _PNL_FULL_SITE_CSS = (
     + _PNL_MOBILITY_CSS
 )
 
+
+def _build_theme_override_css(dark: bool) -> str:
+    """
+    Unconditional CSS override — forces sidebar + main into the chosen palette.
+
+    Specificity note: the bundled CSS uses
+      [data-testid="stAppViewContainer"]:not([data-theme="dark"]) section[data-testid="stSidebar"]
+    which has specificity (0,3,1).  We must match or exceed that to win, even though
+    our <style> block is injected later (ordering only wins if specificity is >=).
+    Fix: double the app-container attribute selector → (0,2,0) prefix, giving us
+      [data-testid="stAppViewContainer"][data-testid="stAppViewContainer"] section[...]
+    = (0,2,0)+(0,0,1)+(0,1,0) = (0,3,1) — same specificity, later rule wins. ✓
+    For nested / class selectors we similarly double to reach (0,3,0) or (0,4,1).
+    """
+    # Shorthand prefixes used in template below
+    APP  = '[data-testid="stAppViewContainer"][data-testid="stAppViewContainer"]'
+    MAIN = f'{APP} section[data-testid="stMain"]'
+    SB   = f'{APP} section[data-testid="stSidebar"]'
+
+    if dark:
+        return f"""<style>
+/* ── DARK THEME OVERRIDE (specificity-hardened) ────────────────── */
+{MAIN}{{background:linear-gradient(180deg,#0b0b0f 0%,#111116 45%,#14141c 100%) !important;color:#e2e8f0 !important;}}
+{MAIN} .block-container{{color:#e2e8f0 !important;font-family:"Inter","DM Sans",system-ui,sans-serif !important;}}
+{MAIN} h1,{MAIN} h2,{MAIN} h3{{color:#f1f5f9 !important;font-family:"Outfit","DM Sans",system-ui,sans-serif !important;}}
+{MAIN} .block-container p,{MAIN} .block-container li,{MAIN} .block-container td{{color:#e2e8f0 !important;}}
+{MAIN} .stMarkdown p,{MAIN} .stMarkdown li,{MAIN} [data-testid="stMarkdownContainer"] p{{color:#e2e8f0 !important;}}
+{MAIN} a{{color:#a5b4fc !important;}}
+{MAIN} [data-testid="stCaption"]{{color:#94a3b8 !important;}}
+{MAIN} [data-testid="stMetricContainer"]{{background:#1a1a24 !important;border:1px solid rgba(148,163,184,.14) !important;border-radius:14px !important;}}
+{MAIN} [data-testid="stMetricValue"]{{color:#f8fafc !important;}}
+{MAIN} [data-testid="stMetricLabel"]{{color:#94a3b8 !important;}}
+{MAIN} [data-testid="stAlert"],{MAIN} div[role="alert"]{{background:#1e293b !important;color:#f1f5f9 !important;border:1px solid #334155 !important;}}
+{MAIN} [data-testid="stAlert"] p,{MAIN} [data-testid="stAlert"] div{{color:#f1f5f9 !important;}}
+{MAIN} [data-testid="stExpander"] details{{background:#1a1a24 !important;border:1px solid #334155 !important;border-radius:12px !important;}}
+{MAIN} [data-testid="stExpander"] summary p,{MAIN} [data-testid="stExpander"] summary span{{color:#f1f5f9 !important;}}
+{MAIN} label,{MAIN} [data-testid="stWidgetLabel"] p{{color:#cbd5e1 !important;}}
+{MAIN} .stTextInput input,{MAIN} .stTextArea textarea{{background:#0f172a !important;color:#f1f5f9 !important;border-color:#475569 !important;}}
+{MAIN} [data-baseweb="select"]>div{{background-color:#1e293b !important;color:#f1f5f9 !important;border-color:#475569 !important;}}
+{MAIN} [data-baseweb="select"] span{{color:#f1f5f9 !important;}}
+{MAIN} pre,{MAIN} code{{background:#0f172a !important;color:#e2e8f0 !important;border:1px solid #334155 !important;}}
+{MAIN} [data-testid="stChatMessage"]{{background:#1a1a24 !important;border:1px solid #2d2d3d !important;}}
+{MAIN} [data-testid="stChatMessage"] p,{MAIN} [data-testid="stChatMessage"] div{{color:#e2e8f0 !important;}}
+{APP} .app-hero{{background:linear-gradient(145deg,#16161f 0%,#1c1c28 100%) !important;border:1px solid rgba(129,140,248,.22) !important;border-left:4px solid #6366f1 !important;box-shadow:0 4px 28px rgba(0,0,0,.5) !important;}}
+{APP} .app-hero-title{{color:#f8fafc !important;-webkit-text-fill-color:#f8fafc !important;background:none !important;font-family:"Outfit",sans-serif !important;}}
+{APP} .app-hero-sub{{color:#94a3b8 !important;}}
+{APP} .app-hero-badge{{color:#c7d2fe !important;background:rgba(99,102,241,.22) !important;border-color:transparent !important;}}
+{APP} .app-hero-view{{color:#cbd5e1 !important;background:rgba(15,23,42,.5) !important;border:1px solid rgba(148,163,184,.15) !important;}}
+{APP} .app-hero-view strong{{color:#a5b4fc !important;}}
+{APP} .pnl-card{{background:#1a1a24 !important;border:1px solid rgba(148,163,184,.14) !important;color:#e2e8f0 !important;}}
+{APP} .pnl-mob-wrap{{border-color:rgba(148,163,184,.2) !important;}}
+{APP} .pnl-mob-table th{{background:#9f1239 !important;border-color:#7f1d1d !important;}}
+{APP} .pnl-mob-table td{{border-color:#475569 !important;color:#f1f5f9 !important;}}
+{APP} .pnl-mob-tr-rev td{{background:#1e3a5f !important;}}
+{APP} .pnl-mob-tr-cost td{{background:#5c3d1e !important;}}
+{APP} .pnl-mob-tr-cm td{{background:#334155 !important;}}
+{APP} .pnl-mob-grand{{background:#1e3a8a !important;}}
+{SB}{{background:linear-gradient(180deg,#1a1b26 0%,#252536 100%) !important;color:#e2e8f0 !important;color-scheme:dark !important;border-right:1px solid rgba(148,163,184,.1) !important;}}
+{SB} .sb-title{{color:#f8fafc !important;}}
+{SB} .sb-nav-label{{color:#64748b !important;}}
+{SB} label,{SB} [data-testid="stWidgetLabel"] p,{SB} .stMarkdown p{{color:#e2e8f0 !important;}}
+{SB} h1,{SB} h2,{SB} h3{{color:#f1f5f9 !important;}}
+{SB} [data-testid="stCaption"],{SB} .stCaption,{SB} div[data-testid="stCaption"] p{{color:#94a3b8 !important;opacity:1 !important;}}
+{SB} .stTextInput input{{background:#2d2d3d !important;color:#f1f5f9 !important;border-color:#3f3f55 !important;}}
+{SB} .stTextInput input::placeholder{{color:#64748b !important;}}
+{SB} textarea{{background:#2d2d3d !important;color:#f1f5f9 !important;border-color:#3f3f55 !important;}}
+{SB} [data-baseweb="select"]>div{{background-color:#2d3348 !important;border-color:#4b5568 !important;color:#f1f5f9 !important;}}
+{SB} [data-baseweb="select"] span,{SB} [data-baseweb="popover"] span{{color:#f1f5f9 !important;}}
+{SB} .stCheckbox label span,{SB} .stToggle label p,{SB} .stToggle label span,{SB} .stRadio label span{{color:#e2e8f0 !important;}}
+{SB} [data-testid="stExpander"] details{{background:rgba(15,23,42,.35) !important;border:1px solid rgba(148,163,184,.15) !important;border-radius:10px !important;}}
+{SB} [data-testid="stExpander"] summary p,{SB} [data-testid="stExpander"] summary span{{color:#f1f5f9 !important;}}
+{SB} .stButton>button[kind="secondary"],{SB} button[data-testid="baseButton-secondary"]{{background:#2d3348 !important;border:1px solid #3f3f55 !important;color:#cbd5e1 !important;}}
+{SB} .stButton>button[kind="secondary"]:hover,{SB} button[data-testid="baseButton-secondary"]:hover{{background:rgba(99,102,241,.2) !important;border-color:#5c5f77 !important;color:#f1f5f9 !important;}}
+{SB} .stButton>button[kind="primary"],{SB} button[data-testid="baseButton-primary"]{{background:linear-gradient(135deg,#4c6ef5 0%,#5c7cfa 100%) !important;color:#fff !important;border:none !important;box-shadow:0 2px 12px rgba(76,110,245,.35) !important;}}
+{SB} button[data-testid="baseButton-primary"] p,{SB} button[data-testid="baseButton-primary"] span{{color:#fff !important;}}
+{SB} button[data-testid="baseButton-secondary"] p,{SB} button[data-testid="baseButton-secondary"] span{{color:#cbd5e1 !important;}}
+{SB} hr{{border-color:#3f3f55 !important;opacity:1 !important;}}
+{SB} .stSlider label p{{color:#e2e8f0 !important;}}
+{SB} .stFileUploader section label,{SB} .stFileUploader small{{color:#94a3b8 !important;}}
+</style>"""
+    else:
+        return f"""<style>
+/* ── LIGHT THEME OVERRIDE (specificity-hardened) ───────────────── */
+{MAIN}{{background:#f1f5f9 !important;color:#1e293b !important;}}
+{MAIN} .block-container{{color:#1e293b !important;font-family:"Inter","DM Sans",system-ui,sans-serif !important;}}
+{MAIN} h1,{MAIN} h2,{MAIN} h3{{color:#0f172a !important;font-family:"Outfit","Inter",system-ui,sans-serif !important;}}
+{MAIN} .block-container p,{MAIN} .block-container li,{MAIN} .block-container td{{color:#475569 !important;}}
+{MAIN} .stMarkdown p,{MAIN} .stMarkdown li,{MAIN} [data-testid="stMarkdownContainer"] p{{color:#475569 !important;}}
+{MAIN} a{{color:#4f46e5 !important;}}
+{MAIN} [data-testid="stCaption"]{{color:#64748b !important;}}
+{MAIN} [data-testid="stMetricContainer"]{{background:#fff !important;border:1px solid #e2e8f0 !important;border-radius:14px !important;box-shadow:0 1px 2px rgba(15,23,42,.04) !important;}}
+{MAIN} [data-testid="stMetricValue"]{{color:#0f172a !important;}}
+{MAIN} [data-testid="stMetricLabel"]{{color:#64748b !important;}}
+{MAIN} [data-testid="stAlert"],{MAIN} div[role="alert"]{{background:#fff !important;color:#0f172a !important;border:1px solid #e2e8f0 !important;}}
+{MAIN} [data-testid="stExpander"] details{{background:#fff !important;border:1px solid #e2e8f0 !important;border-radius:12px !important;}}
+{MAIN} [data-testid="stExpander"] summary p,{MAIN} [data-testid="stExpander"] summary span{{color:#0f172a !important;}}
+{MAIN} label,{MAIN} [data-testid="stWidgetLabel"] p{{color:#334155 !important;}}
+{MAIN} .stTextInput input,{MAIN} .stTextArea textarea{{background:#fff !important;color:#0f172a !important;border-color:#e2e8f0 !important;}}
+{MAIN} [data-baseweb="select"]>div{{background-color:#fff !important;color:#0f172a !important;border-color:#e2e8f0 !important;}}
+{MAIN} [data-baseweb="select"] span{{color:#0f172a !important;}}
+{MAIN} pre,{MAIN} code{{background:#f8fafc !important;color:#1e293b !important;border:1px solid #e2e8f0 !important;}}
+{MAIN} [data-testid="stChatMessage"]{{background:#fff !important;border:1px solid #e2e8f0 !important;}}
+{MAIN} [data-testid="stChatMessage"] p,{MAIN} [data-testid="stChatMessage"] div{{color:#1e293b !important;}}
+{APP} .app-hero{{background:#ffffff !important;border:1px solid #e2e8f0 !important;border-left:4px solid #4f46e5 !important;box-shadow:0 1px 3px rgba(15,23,42,.06) !important;}}
+{APP} .app-hero-title{{color:#0f172a !important;-webkit-text-fill-color:#0f172a !important;background:none !important;font-family:"Outfit",sans-serif !important;}}
+{APP} .app-hero-sub{{color:#64748b !important;}}
+{APP} .app-hero-badge{{color:#4338ca !important;background:#eef2ff !important;border:1px solid #e0e7ff !important;}}
+{APP} .app-hero-view{{color:#475569 !important;background:#f8fafc !important;border:1px solid #e2e8f0 !important;}}
+{APP} .app-hero-view strong{{color:#4f46e5 !important;}}
+{APP} .pnl-card{{background:#fff !important;border:1px solid #e2e8f0 !important;color:#1e293b !important;}}
+{APP} .pnl-mob-wrap{{border-color:#e2e8f0 !important;}}
+{APP} .pnl-mob-table th{{background:#b91c1c !important;border-color:#991b1b !important;}}
+{APP} .pnl-mob-table td{{border-color:#e2e8f0 !important;color:#0f172a !important;}}
+{APP} .pnl-mob-tr-rev td{{background:#e0f2fe !important;}}
+{APP} .pnl-mob-tr-cost td{{background:#ffedd5 !important;}}
+{APP} .pnl-mob-tr-cm td{{background:#e2e8f0 !important;}}
+{APP} .pnl-mob-grand{{background:#dbeafe !important;}}
+{SB}{{background:#f8fafc !important;color:#1e293b !important;color-scheme:light !important;border-right:1px solid #e2e8f0 !important;box-shadow:none !important;}}
+{SB} .sb-logo{{background:linear-gradient(135deg,#6366f1 0%,#4f46e5 100%) !important;color:#fff !important;box-shadow:0 2px 12px rgba(79,70,229,.3) !important;}}
+{SB} .sb-title{{color:#0f172a !important;}}
+{SB} .sb-nav-label{{color:#64748b !important;}}
+{SB} label,{SB} [data-testid="stWidgetLabel"] p,{SB} .stMarkdown p{{color:#334155 !important;}}
+{SB} h1,{SB} h2,{SB} h3{{color:#0f172a !important;}}
+{SB} [data-testid="stCaption"],{SB} .stCaption,{SB} div[data-testid="stCaption"] p{{color:#64748b !important;opacity:1 !important;}}
+{SB} .stTextInput input{{background:#fff !important;color:#0f172a !important;border:1px solid #e2e8f0 !important;box-shadow:none !important;}}
+{SB} .stTextInput input::placeholder{{color:#94a3b8 !important;}}
+{SB} textarea{{background:#fff !important;color:#0f172a !important;border:1px solid #e2e8f0 !important;}}
+{SB} [data-baseweb="select"]>div{{background-color:#fff !important;border:1px solid #e2e8f0 !important;color:#0f172a !important;box-shadow:none !important;}}
+{SB} [data-baseweb="select"] span,{SB} [data-baseweb="popover"] span{{color:#0f172a !important;}}
+{SB} .stCheckbox label span,{SB} .stRadio label span,{SB} .stToggle label p,{SB} .stToggle label span{{color:#334155 !important;}}
+{SB} [data-testid="stExpander"] details{{background:#fff !important;border:1px solid #e2e8f0 !important;border-radius:10px !important;}}
+{SB} [data-testid="stExpander"] summary p,{SB} [data-testid="stExpander"] summary span{{color:#334155 !important;}}
+{SB} .stButton>button[kind="secondary"],{SB} button[data-testid="baseButton-secondary"]{{background:#fff !important;border:1px solid #e2e8f0 !important;color:#334155 !important;box-shadow:none !important;}}
+{SB} .stButton>button[kind="secondary"]:hover,{SB} button[data-testid="baseButton-secondary"]:hover{{background:#f1f5f9 !important;border-color:#cbd5e1 !important;color:#0f172a !important;}}
+{SB} .stButton>button[kind="primary"],{SB} button[data-testid="baseButton-primary"]{{background:linear-gradient(180deg,#6366f1 0%,#4f46e5 100%) !important;color:#fff !important;border:none !important;box-shadow:0 2px 12px rgba(79,70,229,.25) !important;}}
+{SB} button[data-testid="baseButton-primary"] p,{SB} button[data-testid="baseButton-primary"] span{{color:#fff !important;}}
+{SB} button[data-testid="baseButton-secondary"] p,{SB} button[data-testid="baseButton-secondary"] span{{color:#334155 !important;}}
+{SB} hr{{border-color:#e2e8f0 !important;opacity:1 !important;}}
+{SB} .stSlider label p{{color:#334155 !important;}}
+{SB} .stFileUploader section label,{SB} .stFileUploader small{{color:#64748b !important;}}
+{SB} .stTextInput button[data-testid="baseButton-secondary"]{{background:#f1f5f9 !important;border:1px solid #e2e8f0 !important;}}
+</style>"""
+
 # --- Local auth (plain JSON next to this file; first run seeds default admin) ---
 _AUTH_CREDS_FILE = "app_auth_credentials.json"
 _AUTH_DEFAULT_ID = "Admin@123"
 _AUTH_DEFAULT_PASSWORD = "Admin@1234"
+_AUTH_ALL_PAGES = ["Dashboard", "PNL", "AI Chat"]
 
 
 def _auth_credentials_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), _AUTH_CREDS_FILE)
 
 
+def _auth_default_user() -> dict:
+    return {
+        "id": _AUTH_DEFAULT_ID,
+        "password": _AUTH_DEFAULT_PASSWORD,
+        "role": "admin",
+        "pages": _AUTH_ALL_PAGES,
+    }
+
+
+def _auth_normalise_user(u: dict) -> dict:
+    """Back-fill role/pages for users created before this schema existed."""
+    uid = str(u.get("id", ""))
+    role = str(u.get("role", "admin" if uid == _AUTH_DEFAULT_ID else "user"))
+    pages = u.get("pages")
+    if not isinstance(pages, list) or not pages:
+        pages = _AUTH_ALL_PAGES if role == "admin" else []
+    return {
+        "id": uid,
+        "password": str(u.get("password", "")),
+        "role": role,
+        "pages": [p for p in pages if p in _AUTH_ALL_PAGES],
+    }
+
+
 def _load_auth_users() -> List[dict]:
     path = _auth_credentials_path()
-    default_payload = {"users": [{"id": _AUTH_DEFAULT_ID, "password": _AUTH_DEFAULT_PASSWORD}]}
+    default_payload: dict = {"users": [_auth_default_user()]}
     if not os.path.isfile(path):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(default_payload, f, indent=2)
         except OSError:
             pass
-        return list(default_payload["users"])
+        return [_auth_default_user()]
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -767,21 +963,31 @@ def _load_auth_users() -> List[dict]:
                     json.dump(default_payload, f, indent=2)
             except OSError:
                 pass
-            return list(default_payload["users"])
+            return [_auth_default_user()]
         out: List[dict] = []
         for u in users:
             if isinstance(u, dict) and u.get("id") and u.get("password") is not None:
-                out.append({"id": str(u["id"]), "password": str(u["password"])})
+                out.append(_auth_normalise_user(u))
         if not out:
             try:
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(default_payload, f, indent=2)
             except OSError:
                 pass
-            return list(default_payload["users"])
+            return [_auth_default_user()]
         return out
     except (OSError, json.JSONDecodeError, TypeError):
-        return list(default_payload["users"])
+        return [_auth_default_user()]
+
+
+def _auth_save_users(users: List[dict]) -> Tuple[bool, str]:
+    path = _auth_credentials_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"users": users}, f, indent=2)
+        return True, ""
+    except OSError as e:
+        return False, f"Could not save: {e}"
 
 
 def _auth_try_login(user_id: str, password: str) -> Tuple[bool, str]:
@@ -794,7 +1000,20 @@ def _auth_try_login(user_id: str, password: str) -> Tuple[bool, str]:
     return False, "Invalid user ID or password."
 
 
-def _auth_register(user_id: str, password: str, password_confirm: str) -> Tuple[bool, str]:
+def _auth_get_user(user_id: str) -> Optional[dict]:
+    for u in _load_auth_users():
+        if u.get("id") == user_id:
+            return u
+    return None
+
+
+def _auth_register(
+    user_id: str,
+    password: str,
+    password_confirm: str,
+    role: str = "user",
+    pages: Optional[List[str]] = None,
+) -> Tuple[bool, str]:
     uid = (user_id or "").strip()
     if not uid:
         return False, "Enter a user ID."
@@ -805,14 +1024,447 @@ def _auth_register(user_id: str, password: str, password_confirm: str) -> Tuple[
     users = _load_auth_users()
     if any(u.get("id") == uid for u in users):
         return False, "This user ID is already registered. Use **Sign in**."
-    new_users = users + [{"id": uid, "password": password}]
+    allowed_pages = pages if isinstance(pages, list) else (_AUTH_ALL_PAGES if role == "admin" else [])
+    new_entry = {"id": uid, "password": password, "role": role, "pages": allowed_pages}
+    ok, err = _auth_save_users(users + [new_entry])
+    if not ok:
+        return False, f"Could not save account: {err}"
+    return True, ""
+
+
+def _auth_admin_update_user(
+    target_id: str,
+    new_password: Optional[str],
+    new_role: str,
+    new_pages: List[str],
+) -> Tuple[bool, str]:
+    users = _load_auth_users()
+    updated = False
+    for u in users:
+        if u.get("id") == target_id:
+            if new_password:
+                u["password"] = new_password
+            u["role"] = new_role
+            u["pages"] = [p for p in new_pages if p in _AUTH_ALL_PAGES]
+            updated = True
+            break
+    if not updated:
+        return False, "User not found."
+    return _auth_save_users(users)
+
+
+def _auth_admin_delete_user(target_id: str) -> Tuple[bool, str]:
+    if target_id == _AUTH_DEFAULT_ID:
+        return False, "Cannot delete the default admin account."
+    users = _load_auth_users()
+    new_users = [u for u in users if u.get("id") != target_id]
+    if len(new_users) == len(users):
+        return False, "User not found."
+    return _auth_save_users(new_users)
+
+
+# ── API key vault (stored in app_auth_credentials.json under "api_keys") ──────
+
+def _apikeys_load() -> List[dict]:
+    """Return list of {name, key} dicts from credential store."""
     path = _auth_credentials_path()
     try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        keys = data.get("api_keys") if isinstance(data, dict) else None
+        if isinstance(keys, list):
+            return [k for k in keys if isinstance(k, dict) and k.get("name") and k.get("key")]
+    except (OSError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def _apikeys_save(keys: List[dict]) -> Tuple[bool, str]:
+    path = _auth_credentials_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data["api_keys"] = keys
+    try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"users": new_users}, f, indent=2)
+            json.dump(data, f, indent=2)
+        return True, ""
     except OSError as e:
-        return False, f"Could not save account: {e}"
-    return True, ""
+        return False, str(e)
+
+
+def _apikeys_add(name: str, key: str) -> Tuple[bool, str]:
+    name = name.strip()
+    key = key.strip()
+    if not name:
+        return False, "Give the key a name."
+    if not key:
+        return False, "Paste the actual API key."
+    keys = _apikeys_load()
+    if any(k["name"].lower() == name.lower() for k in keys):
+        return False, f'A key named "{name}" already exists.'
+    keys.append({"name": name, "key": key})
+    return _apikeys_save(keys)
+
+
+def _apikeys_delete(name: str) -> Tuple[bool, str]:
+    keys = _apikeys_load()
+    new_keys = [k for k in keys if k["name"] != name]
+    if len(new_keys) == len(keys):
+        return False, "Key not found."
+    return _apikeys_save(new_keys)
+
+
+def render_admin_panel() -> None:
+    """Admin-only page: manage users, roles, and page access."""
+    st.header("Admin Panel — User Management")
+    st.caption(
+        "Only users with the **admin** role can see this page. "
+        "Changes are saved instantly to `app_auth_credentials.json`."
+    )
+
+    users = _load_auth_users()
+
+    # ── User table ──────────────────────────────────────────────────────────
+    st.subheader("All users")
+    if users:
+        tbl_rows = ""
+        for u in users:
+            pages_str = ", ".join(u.get("pages", [])) or "— none —"
+            role_badge = (
+                '<span style="background:#7c3aed;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.75rem;">admin</span>'
+                if u.get("role") == "admin"
+                else '<span style="background:#0369a1;color:#fff;padding:2px 8px;border-radius:4px;font-size:0.75rem;">user</span>'
+            )
+            tbl_rows += (
+                f"<tr><td>{html.escape(u['id'])}</td>"
+                f"<td>{role_badge}</td>"
+                f"<td>{html.escape(pages_str)}</td></tr>"
+            )
+        st.markdown(
+            f'<table style="width:100%;border-collapse:collapse;">'
+            f"<thead><tr>"
+            f'<th style="text-align:left;padding:6px 10px;border-bottom:1px solid #334155;">User ID</th>'
+            f'<th style="text-align:left;padding:6px 10px;border-bottom:1px solid #334155;">Role</th>'
+            f'<th style="text-align:left;padding:6px 10px;border-bottom:1px solid #334155;">Allowed Pages</th>'
+            f"</tr></thead><tbody>"
+            f"{tbl_rows}"
+            f"</tbody></table>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("No users found.")
+
+    st.divider()
+
+    # ── Add new user ─────────────────────────────────────────────────────────
+    with st.expander("➕  Add new user", expanded=False):
+        with st.form("admin_add_user_form", clear_on_submit=True):
+            new_uid = st.text_input("User ID", placeholder="e.g., ops_team_member")
+            new_pw = st.text_input("Password", type="password", placeholder="••••••")
+            new_pw2 = st.text_input("Confirm password", type="password", placeholder="••••••")
+            new_role = st.selectbox("Role", ["user", "admin"])
+            new_pages = st.multiselect(
+                "Allowed pages",
+                _AUTH_ALL_PAGES,
+                default=_AUTH_ALL_PAGES if new_role == "admin" else [],
+                help="Pick which pages this user can access.",
+            )
+            if st.form_submit_button("Create user", type="primary"):
+                ok, msg = _auth_register(new_uid, new_pw, new_pw2, role=new_role, pages=new_pages)
+                if ok:
+                    st.success(f"User **{new_uid}** created.")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    # ── Edit / delete existing user ───────────────────────────────────────────
+    with st.expander("✏️  Edit or delete a user", expanded=False):
+        user_ids = [u["id"] for u in users]
+        edit_uid = st.selectbox("Select user to edit", user_ids, key="admin_edit_user_sel")
+        edit_user = next((u for u in users if u["id"] == edit_uid), None)
+        if edit_user:
+            with st.form("admin_edit_user_form"):
+                e_pw = st.text_input(
+                    "New password (leave blank to keep)",
+                    type="password",
+                    placeholder="••••••",
+                )
+                e_role = st.selectbox(
+                    "Role",
+                    ["user", "admin"],
+                    index=0 if edit_user.get("role") != "admin" else 1,
+                )
+                e_pages = st.multiselect(
+                    "Allowed pages",
+                    _AUTH_ALL_PAGES,
+                    default=[p for p in edit_user.get("pages", []) if p in _AUTH_ALL_PAGES],
+                )
+                col_save, col_del = st.columns(2)
+                with col_save:
+                    if st.form_submit_button("Save changes", type="primary"):
+                        ok, msg = _auth_admin_update_user(
+                            edit_uid,
+                            new_password=e_pw or None,
+                            new_role=e_role,
+                            new_pages=e_pages,
+                        )
+                        if ok:
+                            st.success(f"User **{edit_uid}** updated.")
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                with col_del:
+                    if st.form_submit_button("🗑  Delete user", type="secondary"):
+                        ok, msg = _auth_admin_delete_user(edit_uid)
+                        if ok:
+                            st.success(f"User **{edit_uid}** deleted.")
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+    st.divider()
+
+    # ── API Key Vault ─────────────────────────────────────────────────────────
+    st.subheader("🔑  API Key Vault")
+    st.caption(
+        "Save named API keys here. All users see the key **names** in the sidebar and can pick one — "
+        "the raw key is never shown to non-admins."
+    )
+    saved_keys = _apikeys_load()
+    if saved_keys:
+        key_tbl = ""
+        for k in saved_keys:
+            masked = k["key"][:6] + "••••••••" + k["key"][-4:] if len(k["key"]) > 12 else "••••••••"
+            key_tbl += (
+                f"<tr><td style='padding:5px 10px;'>{html.escape(k['name'])}</td>"
+                f"<td style='padding:5px 10px;font-family:monospace;color:#64748b;'>{masked}</td></tr>"
+            )
+        st.markdown(
+            f'<table style="width:100%;border-collapse:collapse;">'
+            f'<thead><tr>'
+            f'<th style="text-align:left;padding:6px 10px;border-bottom:1px solid #334155;">Key name</th>'
+            f'<th style="text-align:left;padding:6px 10px;border-bottom:1px solid #334155;">Key (masked)</th>'
+            f'</tr></thead><tbody>{key_tbl}</tbody></table>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("No API keys saved yet.")
+
+    with st.expander("➕  Add API key", expanded=False):
+        with st.form("admin_add_apikey_form", clear_on_submit=True):
+            ak_name = st.text_input("Key name", placeholder="e.g. Work Gemini Key")
+            ak_val = st.text_input("API key value", type="password", placeholder="AIza…")
+            if st.form_submit_button("Save key", type="primary"):
+                ok, msg = _apikeys_add(ak_name, ak_val)
+                if ok:
+                    st.success(f"Key **{ak_name}** saved.")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    if saved_keys:
+        with st.expander("🗑  Delete an API key", expanded=False):
+            del_key_name = st.selectbox(
+                "Select key to delete",
+                [k["name"] for k in saved_keys],
+                key="admin_del_apikey_sel",
+            )
+            if st.button("Delete key", key="admin_del_apikey_btn", type="secondary"):
+                ok, msg = _apikeys_delete(del_key_name)
+                if ok:
+                    st.success(f"Key **{del_key_name}** deleted.")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.divider()
+
+    # ── GitHub Push ───────────────────────────────────────────────────────────
+    st.subheader("🐙  Push to GitHub")
+    st.caption(
+        "Upload app files directly to a GitHub repository using a Personal Access Token (PAT). "
+        "Sensitive files (`app_auth_credentials.json`, `*.env`) are **never** uploaded."
+    )
+    _gh_settings = _github_load_settings()
+    with st.form("admin_github_push_form"):
+        gh_token = st.text_input(
+            "GitHub Personal Access Token",
+            value=_gh_settings.get("token", ""),
+            type="password",
+            help="Generate at github.com → Settings → Developer settings → Personal access tokens. Needs repo scope.",
+        )
+        gh_repo = st.text_input(
+            "Repository (owner/repo or full URL)",
+            value=_gh_settings.get("repo", ""),
+            placeholder="e.g. sagarkhekale-arch/Sagar  or  https://github.com/sagarkhekale-arch/Sagar",
+            help="Full GitHub URL is fine — it will be converted automatically.",
+        )
+        gh_branch = st.text_input(
+            "Branch",
+            value=_gh_settings.get("branch", "main"),
+            placeholder="main",
+        )
+        gh_save = st.checkbox("Remember these settings (token stored locally only)", value=True)
+        if st.form_submit_button("🚀  Push to GitHub", type="primary"):
+            if not gh_token or not gh_repo:
+                st.error("PAT token and repository are required.")
+            else:
+                if gh_save:
+                    _github_save_settings({"token": gh_token, "repo": gh_repo, "branch": gh_branch or "main"})
+                with st.spinner("Pushing files to GitHub…"):
+                    results = _github_push_app_files(gh_token, gh_repo, gh_branch or "main")
+                ok_files = [r for r in results if r["ok"]]
+                err_files = [r for r in results if not r["ok"]]
+                if ok_files:
+                    st.success(f"✅ Pushed {len(ok_files)} file(s): " + ", ".join(f"`{r['path']}`" for r in ok_files))
+                if err_files:
+                    for r in err_files:
+                        st.error(f"❌ `{r['path']}` — {r['msg']}")
+
+
+# ── GitHub helper functions ────────────────────────────────────────────────────
+
+_GITHUB_UPLOAD_FILES = [
+    "App.py",
+    "requirements.txt",
+    ".streamlit/config.toml",
+    ".gitignore",
+]
+_GITHUB_SKIP_FILES = {
+    "app_auth_credentials.json",
+}
+
+
+def _github_load_settings() -> dict:
+    path = _auth_credentials_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        s = data.get("github_settings")
+        if isinstance(s, dict):
+            return s
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _github_save_settings(settings: dict) -> None:
+    path = _auth_credentials_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data["github_settings"] = settings
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+def _github_api(token: str, method: str, url: str, body: Optional[dict] = None):
+    """Minimal GitHub API call using only stdlib urllib."""
+    req_body = json.dumps(body).encode() if body else None
+    req = urlrequest.Request(
+        url,
+        data=req_body,
+        method=method,
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+            "User-Agent": "OperationsDashboard/1.0",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except HTTPError as e:
+        try:
+            err_body = json.loads(e.read().decode())
+        except Exception:
+            err_body = {}
+        return e.code, err_body
+
+
+def _github_normalise_repo(repo: str) -> str:
+    """Accept full URL or owner/repo — always return owner/repo."""
+    repo = repo.strip().rstrip("/")
+    for prefix in ("https://github.com/", "http://github.com/", "github.com/"):
+        if repo.startswith(prefix):
+            repo = repo[len(prefix):]
+    # strip trailing .git if present
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    return repo
+
+
+def _github_push_app_files(token: str, repo: str, branch: str) -> List[dict]:
+    """Push whitelisted app files to GitHub via Contents API."""
+    repo = _github_normalise_repo(repo)
+    branch = branch.strip() or "main"
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    results = []
+
+    for rel_path in _GITHUB_UPLOAD_FILES:
+        filename = os.path.basename(rel_path)
+        if filename in _GITHUB_SKIP_FILES:
+            continue
+        full_path = os.path.join(app_dir, rel_path.replace("/", os.sep))
+        if not os.path.isfile(full_path):
+            results.append({"path": rel_path, "ok": False, "msg": "File not found locally — skipped."})
+            continue
+        try:
+            with open(full_path, "rb") as f:
+                raw = f.read()
+            encoded = base64.b64encode(raw).decode()
+        except OSError as e:
+            results.append({"path": rel_path, "ok": False, "msg": str(e)})
+            continue
+
+        api_url = f"https://api.github.com/repos/{repo}/contents/{rel_path}"
+
+        # Fetch existing file SHA (needed for updates; absent for new files)
+        get_status, get_resp = _github_api(
+            token, "GET", f"{api_url}?ref={urllib.parse.quote(branch)}"
+        )
+        sha = get_resp.get("sha") if get_status == 200 else None
+
+        # If repo/branch not found at all, surface a clear message
+        if get_status == 404 and "Branch" in get_resp.get("message", ""):
+            results.append({
+                "path": rel_path,
+                "ok": False,
+                "msg": (
+                    f"Branch '{branch}' not found on GitHub. "
+                    "If the repo is empty, create a README on GitHub first to initialise the branch."
+                ),
+            })
+            continue
+        if get_status == 401:
+            results.append({"path": rel_path, "ok": False, "msg": "Bad credentials — check your PAT token."})
+            continue
+
+        payload: dict = {
+            "message": f"Update {rel_path} via Operations Dashboard",
+            "content": encoded,
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_status, put_resp = _github_api(token, "PUT", api_url, payload)
+        if put_status in (200, 201):
+            results.append({"path": rel_path, "ok": True, "msg": ""})
+        else:
+            msg = put_resp.get("message", f"HTTP {put_status}")
+            results.append({"path": rel_path, "ok": False, "msg": msg})
+
+    return results
 
 
 # Login view only (injected before st.stop() when unauthenticated; not loaded after login)
@@ -1096,6 +1748,172 @@ def google_sheet_to_csv_export_url(user_input: str) -> str:
         gid = gm.group(1) if gm else "0"
         return f"https://docs.google.com/spreadsheets/d/{sid}/export?format=csv&gid={gid}"
     return s
+
+
+_GDRIVE_OAUTH_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+]
+
+
+def _gdrive_oauth_auth_url(client_id: str, client_secret: str, redirect_uri: str) -> Tuple[str, str]:
+    """
+    Build a Google OAuth2 authorization URL.
+    Returns (auth_url, state_token).
+    The user visits auth_url, approves, and Google redirects back to redirect_uri?code=XXX.
+    """
+    import urllib.parse as _up
+    import secrets as _sec
+    state = _sec.token_hex(16)
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(_GDRIVE_OAUTH_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + _up.urlencode(params), state
+
+
+def _gdrive_oauth_exchange_code(
+    client_id: str, client_secret: str, redirect_uri: str, code: str
+) -> dict:
+    """Exchange an OAuth2 authorization code for access + refresh tokens."""
+    import urllib.request as _ur
+    import urllib.parse as _up
+    body = _up.urlencode(
+        {
+            "code": code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        }
+    ).encode()
+    req = _ur.Request(
+        "https://oauth2.googleapis.com/token",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with _ur.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def _gdrive_list_sheets_oauth(token: str) -> List[dict]:
+    """List Google Sheets using an OAuth2 Bearer token."""
+    if not _GDRIVE_OK or _gdrive_build is None:
+        raise ImportError("pip install google-api-python-client")
+    import google.oauth2.credentials as _gc
+    creds = _gc.Credentials(token=token)
+    service = _gdrive_build("drive", "v3", credentials=creds, cache_discovery=False)
+    results = (
+        service.files()
+        .list(
+            q="mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+            fields="files(id,name,modifiedTime)",
+            pageSize=200,
+            orderBy="modifiedTime desc",
+        )
+        .execute()
+    )
+    return results.get("files", [])
+
+
+def _gdrive_sheet_tabs_oauth(token: str, file_id: str) -> List[dict]:
+    """Return worksheet tabs using an OAuth2 Bearer token."""
+    if not _GDRIVE_OK or _gdrive_build is None:
+        return []
+    import google.oauth2.credentials as _gc
+    creds = _gc.Credentials(token=token)
+    svc = _gdrive_build("sheets", "v4", credentials=creds, cache_discovery=False)
+    meta = svc.spreadsheets().get(spreadsheetId=file_id, fields="sheets.properties").execute()
+    return [
+        {"sheetId": s["properties"]["sheetId"], "title": s["properties"]["title"]}
+        for s in meta.get("sheets", [])
+    ]
+
+
+def _gdrive_load_sheet_tab_oauth(token: str, file_id: str, sheet_title: str) -> pd.DataFrame:
+    """Download one worksheet tab using an OAuth2 Bearer token."""
+    import google.oauth2.credentials as _gc
+    creds = _gc.Credentials(token=token)
+    svc = _gdrive_build("sheets", "v4", credentials=creds, cache_discovery=False)
+    resp = svc.spreadsheets().values().get(spreadsheetId=file_id, range=sheet_title).execute()
+    rows = resp.get("values", [])
+    if not rows:
+        return pd.DataFrame()
+    header, *data = rows
+    n = len(header)
+    return pd.DataFrame([r + [""] * (n - len(r)) for r in data], columns=header)
+
+
+def _gdrive_list_sheets(sa_info: dict) -> List[dict]:
+    """
+    List Google Sheets accessible by the service account.
+    Returns list of {id, name, modifiedTime}.
+    Requires google-api-python-client (pip install google-api-python-client).
+    """
+    if not _GDRIVE_OK or _gdrive_build is None:
+        raise ImportError(
+            "google-api-python-client not installed. Run: pip install google-api-python-client"
+        )
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    )
+    service = _gdrive_build("drive", "v3", credentials=creds, cache_discovery=False)
+    results = (
+        service.files()
+        .list(
+            q="mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+            fields="files(id,name,modifiedTime)",
+            pageSize=200,
+            orderBy="modifiedTime desc",
+        )
+        .execute()
+    )
+    return results.get("files", [])
+
+
+def _gdrive_sheet_tabs(sa_info: dict, file_id: str) -> List[dict]:
+    """Return worksheet tabs for a Sheets file: [{sheetId, title}]."""
+    if not _GDRIVE_OK or _gdrive_build is None:
+        return []
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    )
+    svc = _gdrive_build("sheets", "v4", credentials=creds, cache_discovery=False)
+    meta = svc.spreadsheets().get(spreadsheetId=file_id, fields="sheets.properties").execute()
+    return [
+        {"sheetId": s["properties"]["sheetId"], "title": s["properties"]["title"]}
+        for s in meta.get("sheets", [])
+    ]
+
+
+def _gdrive_load_sheet_tab(sa_info: dict, file_id: str, sheet_title: str) -> pd.DataFrame:
+    """Download one worksheet tab and return as DataFrame."""
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    )
+    svc = _gdrive_build("sheets", "v4", credentials=creds, cache_discovery=False)
+    resp = (
+        svc.spreadsheets()
+        .values()
+        .get(spreadsheetId=file_id, range=sheet_title)
+        .execute()
+    )
+    rows = resp.get("values", [])
+    if not rows:
+        return pd.DataFrame()
+    header, *data = rows
+    # Pad shorter rows so all rows have the same number of columns
+    n = len(header)
+    padded = [r + [""] * (n - len(r)) for r in data]
+    return pd.DataFrame(padded, columns=header)
 
 
 def extract_sql_from_text(text: str) -> Optional[str]:
@@ -2615,14 +3433,11 @@ def render_dashboard_ai_panel(
                 sql_used = ut.split(":", 1)[1].strip()
                 with st.spinner("Running SQL on your data…"):
                     result_df = run_sql_on_dataframe(base_for_sql, sql_used)
-                st.session_state[_k_last("Dashboard")] = result_df
-                assistant_content = (
-                    f"SQL returned **{len(result_df):,}** rows. Charts and KPIs above refresh after rerun."
-                )
+                # SQL results are preview-only — base data is never replaced
+                assistant_content = f"SQL returned **{len(result_df):,}** rows (preview below — your base data is unchanged)."
                 st.code(sql_used, language="sql")
                 df_preview = result_df.head(500)
                 st.dataframe(df_preview, use_container_width=True)
-                rerun_after_sql = True
             else:
                 sample_cols = ", ".join([str(c) for c in work_df.columns])
                 sample_preview = work_df.head(200).to_string(index=False)
@@ -2662,17 +3477,16 @@ def render_dashboard_ai_panel(
                     try:
                         with st.spinner("Running SQL from AI reply…"):
                             result_df = run_sql_on_dataframe(base_for_sql, extracted_sql)
-                        st.session_state[_k_last("Dashboard")] = result_df
+                        # Preview only — base data unchanged
                         sql_used = extracted_sql
                         assistant_content = (
                             (assistant_content or "")
-                            + f"\n\n**Executed SQL** → **{len(result_df):,}** rows."
+                            + f"\n\n**Executed SQL** → **{len(result_df):,}** rows (preview, base data unchanged)."
                         )
                         df_preview = result_df.head(500)
                         st.success(f"Executed query: **{len(result_df):,}** rows.")
                         st.code(extracted_sql, language="sql")
                         st.dataframe(df_preview, use_container_width=True)
-                        rerun_after_sql = True
                     except Exception as sql_err:
                         st.warning(f"Could not run SQL from reply: {sql_err}")
                         df_preview = work_df.head(300)
@@ -3699,19 +4513,106 @@ def _render_mobility_pnl_views(df: pd.DataFrame) -> None:
         st.error("No valid dates in the selected date column.")
         return
 
+    dfx["_pm"] = dfx["_dt"].dt.to_period("M")
+
     def _met(sub: pd.DataFrame) -> Dict[str, float]:
         return _mobility_pnl_metrics_for_frame(sub, m)
 
+    mom_dod_keys = [
+        "opd",
+        "rpo",
+        "cpo",
+        "gross_rev",
+        "uber_trip_rev",
+        "wait_trip_rev",
+        "management_fee_only",
+        "incentive_revenue",
+        "net_rider_cost",
+        "base_wait",
+        "mg_cost",
+        "incentive_cost",
+        "cm",
+        "platform_fee",
+        "sfx",
+        "cm1",
+        "margin_pct",
+    ]
+    mom_dod_labels = {
+        "opd": "Mobility OPD (Σ orders)",
+        "rpo": "RPO (gross ÷ Σ orders)",
+        "cpo": "CPO (base+wait+incentive ÷ Σ orders)",
+        "gross_rev": "Gross Revenue (+)",
+        "uber_trip_rev": "Trip Revenue (+) — uber rev net",
+        "wait_trip_rev": "Wait time (trip) (+)",
+        "management_fee_only": "Management Fee (+)",
+        "incentive_revenue": "Incentive (+)",
+        "net_rider_cost": "Net Rider Cost (-)",
+        "base_wait": "Order pay (-)",
+        "mg_cost": "MG cost",
+        "incentive_cost": "Incentive Cost",
+        "cm": "CM",
+        "platform_fee": "Platform Fee Debits",
+        "sfx": "SFX (0.8×PF + rev add)",
+        "cm1": "CM 1",
+        "margin_pct": "Margin %",
+    }
+
+    if mode == "Month on month":
+        months = sorted(dfx["_pm"].unique())
+        if len(months) < 2:
+            st.warning("Need at least **2 calendar months** of rows for month-on-month.")
+            return
+        p0, p1 = months[-2], months[-1]
+        d0 = dfx[dfx["_pm"] == p0]
+        d1 = dfx[dfx["_pm"] == p1]
+        a0, a1 = _met(d0), _met(d1)
+        st.markdown(f"**Months:** {p0} vs **{p1}** (latest)")
+        thead = "<tr><th>Metric</th><th>Prior</th><th>Latest</th><th>Δ</th><th>Δ %</th></tr>"
+        tbody = ""
+        for k in mom_dod_keys:
+            v0, v1 = a0.get(k, float("nan")), a1.get(k, float("nan"))
+            dv = v1 - v0 if pd.notna(v0) and pd.notna(v1) else float("nan")
+            dp = (dv / v0 * 100.0) if pd.notna(v0) and v0 not in (0, float("nan")) and pd.notna(dv) else float("nan")
+            tbody += (
+                f"<tr><td>{html.escape(mom_dod_labels[k])}</td>"
+                f'<td class="num">{_pnl_fmt_compare_val(k, v0)}</td>'
+                f'<td class="num">{_pnl_fmt_compare_val(k, v1)}</td>'
+                f'<td class="num">{_pnl_fmt_compare_delta(k, dv)}</td>'
+                f'<td class="num">{_pnl_fmt_num(dp, pct=True)}</td></tr>'
+            )
+        st.markdown(
+            f'<div class="pnl-mob-wrap"><table class="pnl-mob-table">{thead}{tbody}</table></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    months_list = sorted(dfx["_pm"].dropna().unique())
+    if not months_list:
+        st.warning("No calendar months found in the date range.")
+        return
+    _pm_ix = len(months_list) - 1
+    sel_pm = st.selectbox(
+        "Calendar month (matrix & day-on-day use this month only)",
+        options=months_list,
+        index=_pm_ix,
+        format_func=lambda p: str(p),
+        key="pnl_mob_focus_month",
+    )
+    dfx_work = dfx[dfx["_pm"] == sel_pm].copy()
+    if dfx_work.empty:
+        st.warning("No rows in the selected month.")
+        return
+
     if mode == "Metric (one by one)":
-        met = _met(dfx)
+        met = _met(dfx_work)
         rows = _mobility_pnl_period_display_rows(met)
         row_keys = [r[0] for r in rows]
         labels_by_key = {r[0]: r[1] for r in rows}
 
         st.markdown(
-            f"Period: **{dfx['_dt'].min().date()}** → **{dfx['_dt'].max().date()}** · data rows **{len(dfx):,}**"
+            f"Period: **{dfx_work['_dt'].min().date()}** → **{dfx_work['_dt'].max().date()}** · calendar month **{sel_pm}** · data rows **{len(dfx_work):,}**"
         )
-        sum_o, span_days, day_opd = _pnl_mob_opd_month_and_day_totals(dfx, m)
+        sum_o, span_days, day_opd = _pnl_mob_opd_month_and_day_totals(dfx_work, m)
         _, day_rpo = _pnl_mob_rpo_month_and_day(met, sum_o, span_days)
         _, day_cpo = _pnl_mob_cpo_month_and_day(met, sum_o, span_days)
 
@@ -3845,14 +4746,14 @@ def _render_mobility_pnl_views(df: pd.DataFrame) -> None:
         )
         st.caption(
             "**Lac (period)** = **₹ ÷ 1,00,000** for each line (**not** ÷ orders); **OPD** row shows **Σ orders** (total orders) in this column. "
-            "**₹/order (day)** = line total ÷ **Day OPD** (Σ orders ÷ inclusive days, min→max **Date**). "
+            "**₹/order (day)** = line total ÷ **Day OPD** (Σ orders ÷ inclusive days, min→max **Date** **within the selected calendar month**). "
             "**Gross Revenue** row uses full gross (uber + trip wait + mgmt + incentive). **Trip / Wait / Mgmt / Incentive** rows use each column sum. "
             "**Net Rider Cost** matrix = full **Net Rider Cost** (signed **negative**), incl. MG + wait — so **Gross + Net Rider = CM** in ₹/order. "
             "**CPO** row stays the sheet stack (base+wait+incentive, **positive** ₹/order). "
             "**Order pay** / **Incentive Cost** matrix = **negative** ₹/order (payouts). "
             "**Platform Fee Debits** lac = **−Σ platform_fee**; **SFX** lac = **Σ platform_fee + Σ rev_additional** (matrix definition; MoM **SFX** line may use 0.8×|platform| + rev). "
             "**CM1** (matrix) = **CM + Platform Fee Debits + SFX** (same rupee bases as those rows). **Margin %** = **CM1 ÷ Gross Revenue**. "
-            f"**Days** = **{span_days}** ({dfx['_dt'].min().date()} → {dfx['_dt'].max().date()})."
+            f"**Days** = **{span_days}** ({dfx_work['_dt'].min().date()} → {dfx_work['_dt'].max().date()}) **in month {sel_pm}**."
         )
 
         pick = st.selectbox(
@@ -3899,57 +4800,23 @@ def _render_mobility_pnl_views(df: pd.DataFrame) -> None:
             )
         return
 
-    mom_dod_keys = [
-        "opd",
-        "rpo",
-        "cpo",
-        "gross_rev",
-        "uber_trip_rev",
-        "wait_trip_rev",
-        "management_fee_only",
-        "incentive_revenue",
-        "net_rider_cost",
-        "base_wait",
-        "mg_cost",
-        "incentive_cost",
-        "cm",
-        "platform_fee",
-        "sfx",
-        "cm1",
-        "margin_pct",
-    ]
-    mom_dod_labels = {
-        "opd": "Mobility OPD (Σ orders)",
-        "rpo": "RPO (gross ÷ Σ orders)",
-        "cpo": "CPO (base+wait+incentive ÷ Σ orders)",
-        "gross_rev": "Gross Revenue (+)",
-        "uber_trip_rev": "Trip Revenue (+) — uber rev net",
-        "wait_trip_rev": "Wait time (trip) (+)",
-        "management_fee_only": "Management Fee (+)",
-        "incentive_revenue": "Incentive (+)",
-        "net_rider_cost": "Net Rider Cost (-)",
-        "base_wait": "Order pay (-)",
-        "mg_cost": "MG cost",
-        "incentive_cost": "Incentive Cost",
-        "cm": "CM",
-        "platform_fee": "Platform Fee Debits",
-        "sfx": "SFX (0.8×PF + rev add)",
-        "cm1": "CM 1",
-        "margin_pct": "Margin %",
-    }
-
-    if mode == "Month on month":
-        dfx["_pm"] = dfx["_dt"].dt.to_period("M")
-        months = sorted(dfx["_pm"].unique())
-        if len(months) < 2:
-            st.warning("Need at least **2 calendar months** of rows for month-on-month.")
+    elif mode == "Day on day":
+        dfx_work["_day"] = dfx_work["_dt"].dt.normalize()
+        days = sorted(dfx_work["_day"].unique())
+        if len(days) < 2:
+            st.warning(
+                f"Need at least **2 distinct days** in **{sel_pm}** for day-on-day (same month as matrix)."
+            )
             return
-        p0, p1 = months[-2], months[-1]
-        d0 = dfx[dfx["_pm"] == p0]
-        d1 = dfx[dfx["_pm"] == p1]
-        a0, a1 = _met(d0), _met(d1)
-        st.markdown(f"**Months:** {p0} vs **{p1}** (latest)")
-        thead = "<tr><th>Metric</th><th>Prior</th><th>Latest</th><th>Δ</th><th>Δ %</th></tr>"
+        d0, d1 = days[-2], days[-1]
+        dd0 = dfx_work[dfx_work["_day"] == d0]
+        dd1 = dfx_work[dfx_work["_day"] == d1]
+        a0, a1 = _met(dd0), _met(dd1)
+        st.markdown(
+            f"**Days:** {d0.date()} vs **{d1.date()}** (latest) · calendar month **{sel_pm}** "
+            "(prior vs latest day **within this month only**; not month-on-month)."
+        )
+        thead = "<tr><th>Metric</th><th>Prior day</th><th>Latest day</th><th>Δ</th><th>Δ %</th></tr>"
         tbody = ""
         for k in mom_dod_keys:
             v0, v1 = a0.get(k, float("nan")), a1.get(k, float("nan"))
@@ -3966,36 +4833,6 @@ def _render_mobility_pnl_views(df: pd.DataFrame) -> None:
             f'<div class="pnl-mob-wrap"><table class="pnl-mob-table">{thead}{tbody}</table></div>',
             unsafe_allow_html=True,
         )
-        return
-
-    # Day on day
-    dfx["_day"] = dfx["_dt"].dt.normalize()
-    days = sorted(dfx["_day"].unique())
-    if len(days) < 2:
-        st.warning("Need at least **2 distinct days** for day-on-day.")
-        return
-    d0, d1 = days[-2], days[-1]
-    dd0 = dfx[dfx["_day"] == d0]
-    dd1 = dfx[dfx["_day"] == d1]
-    a0, a1 = _met(dd0), _met(dd1)
-    st.markdown(f"**Days:** {d0.date()} vs **{d1.date()}** (latest)")
-    thead = "<tr><th>Metric</th><th>Prior day</th><th>Latest day</th><th>Δ</th><th>Δ %</th></tr>"
-    tbody = ""
-    for k in mom_dod_keys:
-        v0, v1 = a0.get(k, float("nan")), a1.get(k, float("nan"))
-        dv = v1 - v0 if pd.notna(v0) and pd.notna(v1) else float("nan")
-        dp = (dv / v0 * 100.0) if pd.notna(v0) and v0 not in (0, float("nan")) and pd.notna(dv) else float("nan")
-        tbody += (
-            f"<tr><td>{html.escape(mom_dod_labels[k])}</td>"
-            f'<td class="num">{_pnl_fmt_compare_val(k, v0)}</td>'
-            f'<td class="num">{_pnl_fmt_compare_val(k, v1)}</td>'
-            f'<td class="num">{_pnl_fmt_compare_delta(k, dv)}</td>'
-            f'<td class="num">{_pnl_fmt_num(dp, pct=True)}</td></tr>'
-        )
-    st.markdown(
-        f'<div class="pnl-mob-wrap"><table class="pnl-mob-table">{thead}{tbody}</table></div>',
-        unsafe_allow_html=True,
-    )
 
 
 def render_pnl_ai_panel(
@@ -4058,12 +4895,11 @@ def render_pnl_ai_panel(
                 sql_used = ut.split(":", 1)[1].strip()
                 with st.spinner("Running SQL on PNL data…"):
                     result_df = run_sql_on_dataframe(base_for_sql, sql_used)
-                st.session_state[_k_last("PNL")] = result_df
-                assistant_content = f"SQL returned **{len(result_df):,}** rows. P&L view refreshes after rerun."
+                # Preview only — base data unchanged
+                assistant_content = f"SQL returned **{len(result_df):,}** rows (preview below — base data unchanged)."
                 st.code(sql_used, language="sql")
                 df_preview = result_df.head(500)
                 st.dataframe(df_preview, use_container_width=True)
-                rerun_after_sql = True
             else:
                 sample_cols = ", ".join([str(c) for c in work_df.columns])
                 sample_preview = work_df.head(200).to_string(index=False)
@@ -4104,17 +4940,16 @@ def render_pnl_ai_panel(
                     try:
                         with st.spinner("Running SQL from AI reply…"):
                             result_df = run_sql_on_dataframe(base_for_sql, extracted_sql)
-                        st.session_state[_k_last("PNL")] = result_df
+                        # Preview only — base data unchanged
                         sql_used = extracted_sql
                         assistant_content = (
                             (assistant_content or "")
-                            + f"\n\n**Executed SQL** → **{len(result_df):,}** rows."
+                            + f"\n\n**Executed SQL** → **{len(result_df):,}** rows (preview, base data unchanged)."
                         )
                         df_preview = result_df.head(500)
                         st.success(f"Executed query: **{len(result_df):,}** rows.")
                         st.code(extracted_sql, language="sql")
                         st.dataframe(df_preview, use_container_width=True)
-                        rerun_after_sql = True
                     except Exception as sql_err:
                         st.warning(f"Could not run SQL from reply: {sql_err}")
                         df_preview = work_df.head(300)
@@ -4246,6 +5081,12 @@ if "auth_ok" not in st.session_state:
     st.session_state.auth_ok = False
 if "auth_user" not in st.session_state:
     st.session_state.auth_user = ""
+if "auth_role" not in st.session_state:
+    st.session_state.auth_role = "user"
+if "auth_pages" not in st.session_state:
+    st.session_state.auth_pages = []
+if "app_theme" not in st.session_state:
+    st.session_state.app_theme = "dark"
 
 if not st.session_state.auth_ok:
     _load_auth_users()
@@ -4265,8 +5106,12 @@ if not st.session_state.auth_ok:
             if st.button("Login", type="primary", use_container_width=True, key="login_submit"):
                 ok, msg = _auth_try_login(user_id, password)
                 if ok:
+                    _uid = (user_id or "").strip()
+                    _udata = _auth_get_user(_uid) or {}
                     st.session_state.auth_ok = True
-                    st.session_state.auth_user = (user_id or "").strip()
+                    st.session_state.auth_user = _uid
+                    st.session_state.auth_role = _udata.get("role", "user")
+                    st.session_state.auth_pages = _udata.get("pages", [])
                     st.success("Login successful! Redirecting…")
                     st.rerun()
                 else:
@@ -4289,6 +5134,7 @@ if not st.session_state.auth_ok:
     st.stop()
 
 st.markdown(_PNL_FULL_SITE_CSS, unsafe_allow_html=True)
+st.markdown(_build_theme_override_css(st.session_state.app_theme == "dark"), unsafe_allow_html=True)
 
 # --- Sidebar: vertical nav layout (brand, search, nav items, AI, data, footer) ---
 if "main_view" not in st.session_state:
@@ -4306,28 +5152,62 @@ st.sidebar.text_input(
 )
 st.sidebar.markdown('<p class="sb-nav-label">Navigation</p>', unsafe_allow_html=True)
 
+_is_admin = st.session_state.get("auth_role") == "admin"
+_allowed_pages = st.session_state.get("auth_pages", [])
+
 mv = st.session_state.main_view
-nav_dash = st.sidebar.button(
-    "🏠  Dashboard",
-    help="KPIs & charts (Uber-style ops view)",
-    use_container_width=True,
-    key="nav_btn_dashboard",
-    type="primary" if mv == "Dashboard" else "secondary",
+
+# Redirect to a valid page if current view is not accessible
+_all_accessible = list(_allowed_pages) + (["Admin"] if _is_admin else [])
+if mv not in _all_accessible and _all_accessible:
+    st.session_state.main_view = _all_accessible[0]
+    mv = st.session_state.main_view
+
+nav_dash = (
+    st.sidebar.button(
+        "🏠  Dashboard",
+        help="KPIs & charts (Uber-style ops view)",
+        use_container_width=True,
+        key="nav_btn_dashboard",
+        type="primary" if mv == "Dashboard" else "secondary",
+    )
+    if "Dashboard" in _allowed_pages
+    else False
 )
-nav_pnl = st.sidebar.button(
-    "📑  PNL",
-    help="P&L workspace (same data source as Operations)",
-    use_container_width=True,
-    key="nav_btn_pnl",
-    type="primary" if mv == "PNL" else "secondary",
+nav_pnl = (
+    st.sidebar.button(
+        "📑  PNL",
+        help="P&L workspace (same data source as Operations)",
+        use_container_width=True,
+        key="nav_btn_pnl",
+        type="primary" if mv == "PNL" else "secondary",
+    )
+    if "PNL" in _allowed_pages
+    else False
 )
-nav_chat = st.sidebar.button(
-    "💬  AI Chat",
-    help="Ask questions about your loaded data",
-    use_container_width=True,
-    key="nav_btn_aichat",
-    type="primary" if mv == "AI Chat" else "secondary",
+nav_chat = (
+    st.sidebar.button(
+        "💬  AI Chat",
+        help="Ask questions about your loaded data",
+        use_container_width=True,
+        key="nav_btn_aichat",
+        type="primary" if mv == "AI Chat" else "secondary",
+    )
+    if "AI Chat" in _allowed_pages
+    else False
 )
+nav_admin = (
+    st.sidebar.button(
+        "🛡  Admin",
+        help="Manage users, roles, and page access",
+        use_container_width=True,
+        key="nav_btn_admin",
+        type="primary" if mv == "Admin" else "secondary",
+    )
+    if _is_admin
+    else False
+)
+
 if nav_dash:
     st.session_state.main_view = "Dashboard"
     st.rerun()
@@ -4337,11 +5217,27 @@ if nav_pnl:
 if nav_chat:
     st.session_state.main_view = "AI Chat"
     st.rerun()
+if nav_admin:
+    st.session_state.main_view = "Admin"
+    st.rerun()
 
 st.sidebar.divider()
+_theme_is_dark = st.session_state.app_theme == "dark"
+_theme_label = "🌙  Dark mode" if _theme_is_dark else "☀️  Light mode"
+if st.sidebar.button(
+    _theme_label,
+    key="btn_toggle_theme",
+    use_container_width=True,
+    help="Switch between dark and light mode (applies to sidebar + main together)",
+):
+    st.session_state.app_theme = "light" if _theme_is_dark else "dark"
+    st.rerun()
+
 if st.sidebar.button("Log out", key="btn_auth_logout", use_container_width=True):
     st.session_state.auth_ok = False
     st.session_state.auth_user = ""
+    st.session_state.auth_role = "user"
+    st.session_state.auth_pages = []
     st.rerun()
 if st.session_state.get("auth_user"):
     st.sidebar.caption(f"Signed in as **{st.session_state.auth_user}**")
@@ -4371,14 +5267,31 @@ if ai_provider == "Local (Ollama)":
         )
 
 gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
-show_ai_key = st.sidebar.checkbox("Show Gemini API key input (advanced)", value=False)
-if ai_provider == "Gemini API" and (show_ai_key or not gemini_api_key):
-    gemini_api_key = st.sidebar.text_input(
-        "Gemini API key",
-        value=gemini_api_key,
-        type="password",
-        help="Recommended: set GEMINI_API_KEY as an environment variable instead of pasting here.",
-    ).strip()
+if ai_provider == "Gemini API":
+    _saved_api_keys = _apikeys_load()
+    if _saved_api_keys:
+        _key_names = ["— select a saved key —"] + [k["name"] for k in _saved_api_keys]
+        _sel_key_name = st.sidebar.selectbox(
+            "API key",
+            _key_names,
+            key="sb_apikey_sel",
+            help="Keys are managed by admin in the Admin panel.",
+        )
+        if _sel_key_name != "— select a saved key —":
+            _matched = next((k for k in _saved_api_keys if k["name"] == _sel_key_name), None)
+            if _matched:
+                gemini_api_key = _matched["key"]
+    if _is_admin:
+        show_ai_key = st.sidebar.checkbox("Enter key manually (admin only)", value=not bool(_saved_api_keys))
+        if show_ai_key or not gemini_api_key:
+            gemini_api_key = st.sidebar.text_input(
+                "Gemini API key",
+                value=gemini_api_key,
+                type="password",
+                help="Paste a key directly, or save it in Admin → API Key Vault to share with all users.",
+            ).strip()
+    elif not gemini_api_key:
+        st.sidebar.warning("No API key selected. Ask your admin to add one in the Admin panel.")
 
 gemini_model_name = "gemini-2.5-flash"
 if ai_provider == "Gemini API":
@@ -4388,9 +5301,11 @@ if ai_provider == "Gemini API":
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
             "gemini-2.5-pro",
+            "gemini-3-flash",
+            "gemini-3.1-flash",
         ],
         index=0,
-        help="Older IDs like gemini-1.5-flash may 404 on the current API — use 2.5.x per ai.google.dev models doc.",
+        help="Select the Gemini model to use. Newer models (3.x) require access via ai.google.dev.",
     )
 
 st.sidebar.divider()
@@ -4400,7 +5315,13 @@ st.sidebar.caption(
 )
 db_type = st.sidebar.selectbox(
     "Select Database Type",
-    ["BigQuery", "Upload CSV / Excel", "Google Sheet (CSV link)", "Other SQL (Postgres/MySQL)"],
+    [
+        "BigQuery",
+        "Upload CSV / Excel",
+        "Google Sheet (CSV link)",
+        "Google Drive (pick a Sheet)",
+        "Other SQL (Postgres/MySQL)",
+    ],
 )
 
 # Shared session state (BigQuery + file + sheet modes)
@@ -4441,6 +5362,27 @@ for _v in ("Dashboard", "PNL", "AI Chat"):
 main_view = st.session_state.main_view
 
 _render_app_hero(main_view)
+
+# ── Access guard ────────────────────────────────────────────────────────────
+_cur_is_admin = st.session_state.get("auth_role") == "admin"
+_cur_pages = st.session_state.get("auth_pages", [])
+
+if main_view == "Admin":
+    if not _cur_is_admin:
+        st.error("You do not have permission to access the **Admin** panel.")
+        st.stop()
+    render_admin_panel()
+    st.stop()
+elif main_view not in _cur_pages:
+    _accessible = list(_cur_pages) + (["Admin"] if _cur_is_admin else [])
+    if _accessible:
+        st.warning(
+            f"You do not have access to **{main_view}**. "
+            f"Accessible pages: {', '.join(_accessible)}."
+        )
+    else:
+        st.warning("Your account has no pages assigned. Contact an admin.")
+    st.stop()
 
 if db_type == "BigQuery":
     st.sidebar.subheader("BigQuery auth")
@@ -4902,12 +5844,7 @@ elif db_type == "Upload CSV / Excel":
         except Exception as e:
             st.sidebar.error(str(e))
 
-    if st.session_state.get(_k_upload_orig(main_view)) is not None:
-        if st.sidebar.button(
-            "Reset to original file (undo SQL result)", key=f"btn_reset_upload_{_uk}"
-        ):
-            st.session_state[_k_last(main_view)] = st.session_state[_k_upload_orig(main_view)].copy()
-            st.sidebar.success("Restored full original table.")
+    # No reset button needed — SQL results are preview-only and never replace the loaded data.
 
     if main_view == "AI Chat":
         st.markdown(
@@ -4961,15 +5898,11 @@ elif db_type == "Upload CSV / Excel":
                         sql_used = ut.split(":", 1)[1].strip()
                         with st.spinner("Running SQL on your data…"):
                             result_df = run_sql_on_dataframe(base_df, sql_used)
-                        st.session_state[_k_last("AI Chat")] = result_df
-                        assistant_content = (
-                            f"SQL returned **{len(result_df):,}** rows. **Loaded data** at the top now shows this result. "
-                            f"Use **Reset to original file** to restore the raw CSV."
-                        )
+                        # Preview only — base data is never replaced
+                        assistant_content = f"SQL returned **{len(result_df):,}** rows (preview below — your base data is unchanged)."
                         st.code(sql_used, language="sql")
                         df_preview = result_df
                         st.dataframe(df_preview, use_container_width=True)
-                        rerun_after_sql = True
                     else:
                         sample_cols = ", ".join([str(c) for c in work.columns])
                         sample_preview = work.head(200).to_string(index=False)
@@ -4981,16 +5914,16 @@ elif db_type == "Upload CSV / Excel":
                             Reply with ONE line the app can run (DuckDB on table `data`):
                             sql: SELECT ... FROM data ...;
                             Table name is always `data` (columns: {sample_cols}).
-    
+
                             Columns:
                             {sample_cols}
-    
+
                             Summary stats:
                             {stats_preview}
-    
+
                             Sample rows:
                             {sample_preview}
-    
+
                             User question:
                             {ut}
                             """
@@ -5010,17 +5943,16 @@ elif db_type == "Upload CSV / Excel":
                             try:
                                 with st.spinner("Running SQL from AI reply…"):
                                     result_df = run_sql_on_dataframe(base_df, extracted_sql)
-                                st.session_state[_k_last("AI Chat")] = result_df
+                                # Preview only — base data unchanged
                                 sql_used = extracted_sql
                                 assistant_content = (
                                     (assistant_content or "")
-                                    + f"\n\n**Executed SQL** → **{len(result_df):,}** rows. **Loaded data** at the top is updated."
+                                    + f"\n\n**Executed SQL** → **{len(result_df):,}** rows (preview, base data unchanged)."
                                 )
                                 df_preview = result_df
-                                st.success(f"Executed query: **{len(result_df):,}** rows (see **Loaded data** above).")
+                                st.success(f"Executed query: **{len(result_df):,}** rows.")
                                 st.code(extracted_sql, language="sql")
                                 st.dataframe(df_preview, use_container_width=True)
-                                rerun_after_sql = True
                             except Exception as sql_err:
                                 st.warning(f"Could not run SQL from reply: {sql_err}")
                                 df_preview = work.head(500)
@@ -5100,12 +6032,7 @@ elif db_type == "Google Sheet (CSV link)":
                 f"{e} — If the sheet is private, share as viewable link or export CSV and use Upload instead."
             )
 
-    if st.session_state.get(_k_upload_orig(main_view)) is not None:
-        if st.sidebar.button(
-            "Reset to original sheet (undo SQL result)", key=f"btn_reset_sheet_{_suk}"
-        ):
-            st.session_state[_k_last(main_view)] = st.session_state[_k_upload_orig(main_view)].copy()
-            st.sidebar.success("Restored full original sheet.")
+    # No reset button needed — SQL results are preview-only and never replace the loaded data.
 
     if main_view == "AI Chat":
         st.markdown(
@@ -5153,15 +6080,11 @@ elif db_type == "Google Sheet (CSV link)":
                         sql_used = ut2.split(":", 1)[1].strip()
                         with st.spinner("Running SQL on your data…"):
                             result_df = run_sql_on_dataframe(base_df, sql_used)
-                        st.session_state[_k_last("AI Chat")] = result_df
-                        assistant_content = (
-                            f"SQL returned **{len(result_df):,}** rows. **Loaded data** at the top is updated. "
-                            f"Use **Reset to original sheet** to restore the raw load."
-                        )
+                        # Preview only — base data is never replaced
+                        assistant_content = f"SQL returned **{len(result_df):,}** rows (preview below — base data unchanged)."
                         st.code(sql_used, language="sql")
                         df_preview = result_df
                         st.dataframe(df_preview, use_container_width=True)
-                        rerun_after_sql = True
                     else:
                         sample_cols = ", ".join([str(c) for c in work.columns])
                         sample_preview = work.head(200).to_string(index=False)
@@ -5172,16 +6095,16 @@ elif db_type == "Google Sheet (CSV link)":
                             If the user wants a pivot or GROUP BY summary, reply with ONE line:
                             sql: SELECT ... FROM data ...;
                             Table name is `data` (columns: {sample_cols}).
-    
+
                             Columns:
                             {sample_cols}
-    
+
                             Summary stats:
                             {stats_preview}
-    
+
                             Sample rows:
                             {sample_preview}
-    
+
                             User question:
                             {ut2}
                             """
@@ -5201,17 +6124,16 @@ elif db_type == "Google Sheet (CSV link)":
                             try:
                                 with st.spinner("Running SQL from AI reply…"):
                                     result_df = run_sql_on_dataframe(base_df, extracted_sql)
-                                st.session_state[_k_last("AI Chat")] = result_df
+                                # Preview only — base data unchanged
                                 sql_used = extracted_sql
                                 assistant_content = (
                                     (assistant_content or "")
-                                    + f"\n\n**Executed SQL** → **{len(result_df):,}** rows."
+                                    + f"\n\n**Executed SQL** → **{len(result_df):,}** rows (preview, base data unchanged)."
                                 )
                                 df_preview = result_df
                                 st.success(f"Executed query: **{len(result_df):,}** rows.")
                                 st.code(extracted_sql, language="sql")
                                 st.dataframe(df_preview, use_container_width=True)
-                                rerun_after_sql = True
                             except Exception as sql_err:
                                 st.warning(f"Could not run SQL from reply: {sql_err}")
                                 df_preview = work.head(500)
@@ -5253,6 +6175,201 @@ elif db_type == "Google Sheet (CSV link)":
             ollama_base_url=ollama_base_url,
             ollama_model=ollama_model,
         )
+
+elif db_type == "Google Drive (pick a Sheet)":
+    st.sidebar.subheader("Google Drive — Sheets picker")
+    _gd_tab = _tab_suf(main_view)
+
+    # ── Auth method: Google Account (OAuth2) or Service Account JSON ────────
+    _gd_auth_method = st.sidebar.radio(
+        "Sign in with",
+        ["Google Account (OAuth2)", "Service Account JSON"],
+        key=f"gdrive_auth_method_{_gd_tab}",
+        horizontal=True,
+    )
+    st.sidebar.caption(f"Sheet loads into the **{main_view}** tab only.")
+
+    _gd_oauth_token: Optional[str] = st.session_state.get(f"gdrive_oauth_token_{_gd_tab}")
+    _gd_sa_info: Optional[dict] = None
+
+    if _gd_auth_method == "Google Account (OAuth2)":
+        # ── Step 1: credentials ─────────────────────────────────────────────
+        with st.sidebar.expander("OAuth2 App credentials", expanded=_gd_oauth_token is None):
+            st.caption(
+                "Create a **OAuth 2.0 Client ID** in Google Cloud Console → APIs & Services → Credentials. "
+                "Choose **Web application**, add `http://localhost:8501` (or your app URL) as an Authorized redirect URI."
+            )
+            _gd_client_id = st.text_input("Client ID", key=f"gdrive_cid_{_gd_tab}", placeholder="…apps.googleusercontent.com")
+            _gd_client_secret = st.text_input("Client Secret", key=f"gdrive_csec_{_gd_tab}", type="password")
+            _gd_redirect = st.text_input(
+                "Redirect URI (must match Cloud Console)",
+                value="http://localhost:8501",
+                key=f"gdrive_redir_{_gd_tab}",
+            )
+
+        if _gd_client_id and _gd_client_secret:
+            # ── Step 2: if we got a code back in URL params, exchange it ────
+            _qp = st.query_params
+            _oauth_code = _qp.get("code", "")
+            _oauth_state = _qp.get("state", "")
+            _expected_state = st.session_state.get(f"gdrive_oauth_state_{_gd_tab}", "")
+            if _oauth_code and (not _expected_state or _oauth_state == _expected_state):
+                if not _gd_oauth_token:
+                    try:
+                        with st.spinner("Exchanging code for token…"):
+                            _tok = _gdrive_oauth_exchange_code(
+                                _gd_client_id, _gd_client_secret, _gd_redirect, _oauth_code
+                            )
+                        _gd_oauth_token = _tok.get("access_token", "")
+                        st.session_state[f"gdrive_oauth_token_{_gd_tab}"] = _gd_oauth_token
+                        # Clear the code from URL
+                        st.query_params.clear()
+                        st.sidebar.success("Google account connected!")
+                        st.rerun()
+                    except Exception as _oe:
+                        st.sidebar.error(f"Token exchange failed: {_oe}")
+
+            if not _gd_oauth_token:
+                # ── Step 3: show the login button ───────────────────────────
+                _auth_url, _state = _gdrive_oauth_auth_url(_gd_client_id, _gd_client_secret, _gd_redirect)
+                st.session_state[f"gdrive_oauth_state_{_gd_tab}"] = _state
+                st.sidebar.link_button(
+                    "🔑  Sign in with Google",
+                    _auth_url,
+                    use_container_width=True,
+                )
+                st.sidebar.caption("Click above → allow access → you'll be redirected back here automatically.")
+            else:
+                st.sidebar.success("✅ Google account connected")
+                if st.sidebar.button("Disconnect", key=f"btn_gdrive_disco_{_gd_tab}"):
+                    st.session_state.pop(f"gdrive_oauth_token_{_gd_tab}", None)
+                    st.rerun()
+
+    else:
+        # ── Service Account JSON path ────────────────────────────────────────
+        _gd_sa_file = st.sidebar.file_uploader(
+            "Service account JSON",
+            type=["json"],
+            key=f"gdrive_sa_{_gd_tab}",
+        )
+        if _gd_sa_file:
+            try:
+                _gd_sa_info = json.load(_gd_sa_file)
+                st.sidebar.caption(f"Account: `{_gd_sa_info.get('client_email','?')}`")
+            except Exception as _gd_e:
+                st.sidebar.error(f"Bad JSON: {_gd_e}")
+                _gd_sa_info = None
+
+    # ── Sheets listing (works for both auth methods) ─────────────────────────
+    _gd_ready = bool(_gd_oauth_token) or bool(_gd_sa_info)
+    if _gd_ready:
+        if st.sidebar.button("🔄  List my Google Sheets", key=f"btn_gdrive_list_{_gd_tab}", use_container_width=True):
+            try:
+                with st.spinner("Fetching sheet list from Drive…"):
+                    if _gd_oauth_token:
+                        _sheets = _gdrive_list_sheets_oauth(_gd_oauth_token)
+                    else:
+                        _sheets = _gdrive_list_sheets(_gd_sa_info)  # type: ignore[arg-type]
+                st.session_state[f"gdrive_sheets_{_gd_tab}"] = _sheets
+                if not _sheets:
+                    st.sidebar.warning("No sheets found. Make sure you have at least one Google Sheet in your Drive.")
+            except Exception as _gd_e:
+                st.sidebar.error(str(_gd_e))
+
+        _gdrive_sheets = st.session_state.get(f"gdrive_sheets_{_gd_tab}", [])
+        if _gdrive_sheets:
+            _sheet_names = [s["name"] for s in _gdrive_sheets]
+            _picked_name = st.sidebar.selectbox(
+                "Select a Google Sheet",
+                _sheet_names,
+                key=f"gdrive_pick_sheet_{_gd_tab}",
+            )
+            _picked_file = next((s for s in _gdrive_sheets if s["name"] == _picked_name), None)
+            if _picked_file:
+                if st.sidebar.button("Load tabs", key=f"btn_gdrive_tabs_{_gd_tab}", use_container_width=True):
+                    try:
+                        with st.spinner(f"Loading tabs for '{_picked_name}'…"):
+                            if _gd_oauth_token:
+                                _tabs = _gdrive_sheet_tabs_oauth(_gd_oauth_token, _picked_file["id"])
+                            else:
+                                _tabs = _gdrive_sheet_tabs(_gd_sa_info, _picked_file["id"])  # type: ignore[arg-type]
+                        st.session_state[f"gdrive_tabs_{_gd_tab}"] = _tabs
+                    except Exception as _te:
+                        st.sidebar.error(str(_te))
+
+                _gdrive_tabs = st.session_state.get(f"gdrive_tabs_{_gd_tab}", [])
+                if _gdrive_tabs:
+                    _tab_titles = [t["title"] for t in _gdrive_tabs]
+                    _picked_tab = st.sidebar.selectbox(
+                        "Select worksheet tab",
+                        _tab_titles,
+                        key=f"gdrive_pick_tab_{_gd_tab}",
+                    )
+                    if st.sidebar.button(
+                        f"📥  Load '{_picked_tab}' into {main_view}",
+                        type="primary",
+                        key=f"btn_gdrive_load_{_gd_tab}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            with st.spinner(f"Loading '{_picked_tab}' from '{_picked_name}'…"):
+                                if _gd_oauth_token:
+                                    _gd_df = _gdrive_load_sheet_tab_oauth(
+                                        _gd_oauth_token, _picked_file["id"], _picked_tab
+                                    )
+                                else:
+                                    _gd_df = _gdrive_load_sheet_tab(
+                                        _gd_sa_info, _picked_file["id"], _picked_tab  # type: ignore[arg-type]
+                                    )
+                            if _gd_df.empty:
+                                st.sidebar.warning("Sheet/tab appears empty.")
+                            else:
+                                st.session_state[_k_upload_orig(main_view)] = _gd_df.copy()
+                                st.session_state[_k_last(main_view)] = _gd_df
+                                st.session_state[_k_sample(main_view)] = _gd_df
+                                st.session_state[_k_sample_raw(main_view)] = _gd_df.copy()
+                                st.session_state[_k_file_label(main_view)] = f"{_picked_name} › {_picked_tab}"
+                                st.sidebar.success(
+                                    f"Loaded **{len(_gd_df):,}** rows · **{len(_gd_df.columns)}** cols "
+                                    f"from **{_picked_name} › {_picked_tab}** into **{main_view}**."
+                                )
+                        except Exception as _le:
+                            st.sidebar.error(str(_le))
+
+    if main_view == "Dashboard":
+        render_dashboard_tab(
+            db_type,
+            st.session_state.get(_k_last("Dashboard")),
+            ai_provider=ai_provider,
+            gemini_api_key=gemini_api_key,
+            gemini_model_name=gemini_model_name,
+            ollama_base_url=ollama_base_url,
+            ollama_model=ollama_model,
+        )
+    elif main_view == "PNL":
+        render_pnl_tab(
+            db_type,
+            st.session_state.get(_k_last("PNL")),
+            ai_provider=ai_provider,
+            gemini_api_key=gemini_api_key,
+            gemini_model_name=gemini_model_name,
+            ollama_base_url=ollama_base_url,
+            ollama_model=ollama_model,
+        )
+    elif main_view == "AI Chat":
+        _gd_chat_df = st.session_state.get(_k_last("AI Chat"))
+        if isinstance(_gd_chat_df, pd.DataFrame) and not _gd_chat_df.empty:
+            render_loaded_data_panel(
+                _gd_chat_df,
+                key_prefix="gdrive_chat",
+                ai_provider=ai_provider,
+                gemini_api_key=gemini_api_key,
+                gemini_model_name=gemini_model_name,
+                ollama_base_url=ollama_base_url,
+                ollama_model=ollama_model,
+            )
+        else:
+            st.info("Upload a service-account JSON, list sheets, pick one, select a tab, and click **Load**.")
 
 elif db_type == "Other SQL (Postgres/MySQL)":
     st.sidebar.caption(f"Fetch applies to the **{main_view}** tab only.")
