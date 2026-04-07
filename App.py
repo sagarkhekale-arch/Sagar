@@ -44,14 +44,13 @@ _APP_THEME_CSS = """
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-/* Hide ONLY the right-side action buttons (deploy, settings, share).
-   Do NOT hide stToolbar or stHeader — the sidebar toggle lives inside them. */
+/* Hide the deploy/settings toolbar and decoration bar only.
+   We deliberately do NOT touch the header itself or any button inside it
+   so the sidebar collapse/expand arrow always works. */
+[data-testid="stToolbar"] { display: none !important; }
 [data-testid="stDecoration"] { display: none !important; }
 #MainMenu { display: none !important; }
-/* Hide the toolbar action buttons on the right (theme picker, deploy, etc.)
-   without touching the sidebar collapse/expand arrow on the left. */
-[data-testid="stToolbarActions"] { display: none !important; }
-/* Make header background transparent so it blends in */
+/* Make header blend into the page background — zero visual footprint */
 header[data-testid="stHeader"] {
     background-color: transparent !important;
     box-shadow: none !important;
@@ -5276,28 +5275,23 @@ gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
 if ai_provider == "Gemini API":
     _saved_api_keys = _apikeys_load()
     if _saved_api_keys:
-        _key_names = ["— select a saved key —"] + [k["name"] for k in _saved_api_keys]
+        # Dropdown for everyone — names only, raw key never shown
+        _key_options = [k["name"] for k in _saved_api_keys]
         _sel_key_name = st.sidebar.selectbox(
-            "API key",
-            _key_names,
+            "Select API key",
+            _key_options,
             key="sb_apikey_sel",
-            help="Keys are managed by admin in the Admin panel.",
+            help="Saved keys are managed by admin in Admin → API Key Vault.",
         )
-        if _sel_key_name != "— select a saved key —":
-            _matched = next((k for k in _saved_api_keys if k["name"] == _sel_key_name), None)
-            if _matched:
-                gemini_api_key = _matched["key"]
-    if _is_admin:
-        show_ai_key = st.sidebar.checkbox("Enter key manually (admin only)", value=not bool(_saved_api_keys))
-        if show_ai_key or not gemini_api_key:
-            gemini_api_key = st.sidebar.text_input(
-                "Gemini API key",
-                value=gemini_api_key,
-                type="password",
-                help="Paste a key directly, or save it in Admin → API Key Vault to share with all users.",
-            ).strip()
-    elif not gemini_api_key:
-        st.sidebar.warning("No API key selected. Ask your admin to add one in the Admin panel.")
+        _matched = next((k for k in _saved_api_keys if k["name"] == _sel_key_name), None)
+        if _matched:
+            gemini_api_key = _matched["key"]
+    else:
+        # No keys saved yet
+        if _is_admin:
+            st.sidebar.info("No API keys saved. Go to **Admin → 🔑 API Key Vault** to add one.")
+        else:
+            st.sidebar.warning("No API key available. Ask your admin to add one.")
 
 gemini_model_name = "gemini-2.5-flash"
 if ai_provider == "Gemini API":
@@ -5853,15 +5847,10 @@ elif db_type == "Upload CSV / Excel":
     # No reset button needed — SQL results are preview-only and never replace the loaded data.
 
     if main_view == "AI Chat":
-        st.markdown(
-            "Load a **CSV** or **Excel** file. **Loaded data** shows whatever is active (raw file or SQL result).\n\n"
-            "**Pivot / summary:** run SQL on your data with a chat message starting with `sql:` — use table name **`data`** "
-            "(not `data.csv`). Example: `sql: SELECT city_name, COUNT(DISTINCT order_id) AS orders FROM data GROUP BY city_name`\n\n"
-            "Requires: `pip install duckdb`."
-        )
-    
         _chat_ldf = st.session_state.get(_k_last("AI Chat"))
-        if isinstance(_chat_ldf, pd.DataFrame) and not _chat_ldf.empty:
+        _has_data = isinstance(_chat_ldf, pd.DataFrame) and not _chat_ldf.empty
+
+        if _has_data:
             render_loaded_data_panel(
                 _chat_ldf,
                 key_prefix="upload",
@@ -5871,7 +5860,11 @@ elif db_type == "Upload CSV / Excel":
                 ollama_base_url=ollama_base_url,
                 ollama_model=ollama_model,
             )
-    
+            st.caption("💡 Data loaded — ask questions about your data, or type `sql:` to run a query. Or just chat freely.")
+        else:
+            st.caption("💬 Ask me anything — load a file from the sidebar to also analyse data.")
+
+        # Render chat history
         for m in st.session_state.messages:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
@@ -5880,10 +5873,9 @@ elif db_type == "Upload CSV / Excel":
                         st.code(m["sql"], language="sql")
                 if m.get("df_preview") is not None:
                     st.dataframe(m["df_preview"], use_container_width=True)
-    
+
         ut = st.chat_input(
-            "Ask about your uploaded data…",
-            disabled=st.session_state.get(_k_last("AI Chat")) is None,
+            "Ask about your data… (e.g., 'last 30 days PnL by city')",
             key="chat_upload",
         )
         if ut:
@@ -5894,54 +5886,43 @@ elif db_type == "Upload CSV / Excel":
             assistant_content = ""
             df_preview = None
             sql_used = None
-            rerun_after_sql = False
             extracted_sql = None
             with st.chat_message("assistant"):
                 try:
-                    if work is None or work.empty:
-                        raise ValueError("Load a file first.")
-                    if ut.strip().lower().startswith("sql:"):
+                    # ── SQL shortcut: user typed sql: directly ──────────────
+                    if ut.strip().lower().startswith("sql:") and base_df is not None:
                         sql_used = ut.split(":", 1)[1].strip()
-                        with st.spinner("Running SQL on your data…"):
+                        with st.spinner("Running SQL…"):
                             result_df = run_sql_on_dataframe(base_df, sql_used)
-                        # Preview only — base data is never replaced
-                        assistant_content = f"SQL returned **{len(result_df):,}** rows (preview below — your base data is unchanged)."
+                        assistant_content = f"SQL returned **{len(result_df):,}** rows (preview — base data unchanged)."
                         st.code(sql_used, language="sql")
                         df_preview = result_df
                         st.dataframe(df_preview, use_container_width=True)
-                    else:
+
+                    # ── Data loaded: ask AI about the data ─────────────────
+                    elif base_df is not None and not base_df.empty:
                         sample_cols = ", ".join([str(c) for c in work.columns])
                         sample_preview = work.head(200).to_string(index=False)
                         stats_preview = work.describe(include="all").fillna("").to_string()
                         sample_prompt = textwrap.dedent(
                             f"""
-                            You are a data analyst. Answer ONLY from this dataset.
-                            If the user wants a pivot, aggregation, or GROUP BY summary, do NOT paste a wall of raw rows.
-                            Reply with ONE line the app can run (DuckDB on table `data`):
-                            sql: SELECT ... FROM data ...;
-                            Table name is always `data` (columns: {sample_cols}).
+                            You are a helpful data analyst assistant.
+                            The user has loaded a dataset. Answer their question using the data below.
+                            If a pivot/aggregation is needed, suggest a SQL query using table name `data`.
 
-                            Columns:
-                            {sample_cols}
-
+                            Columns: {sample_cols}
                             Summary stats:
                             {stats_preview}
-
                             Sample rows:
                             {sample_preview}
 
-                            User question:
-                            {ut}
+                            User question: {ut}
                             """
                         ).strip()
-                        with st.spinner("Analyzing…"):
+                        with st.spinner("Thinking…"):
                             assistant_content = call_ai_text_unified(
-                                sample_prompt,
-                                ai_provider,
-                                gemini_api_key,
-                                gemini_model_name,
-                                ollama_base_url,
-                                ollama_model,
+                                sample_prompt, ai_provider, gemini_api_key,
+                                gemini_model_name, ollama_base_url, ollama_model,
                             )
                         st.markdown(assistant_content or "OK.")
                         extracted_sql = extract_sql_from_text(assistant_content)
@@ -5949,26 +5930,39 @@ elif db_type == "Upload CSV / Excel":
                             try:
                                 with st.spinner("Running SQL from AI reply…"):
                                     result_df = run_sql_on_dataframe(base_df, extracted_sql)
-                                # Preview only — base data unchanged
                                 sql_used = extracted_sql
                                 assistant_content = (
                                     (assistant_content or "")
-                                    + f"\n\n**Executed SQL** → **{len(result_df):,}** rows (preview, base data unchanged)."
+                                    + f"\n\n*Executed SQL → **{len(result_df):,}** rows (preview).*"
                                 )
                                 df_preview = result_df
-                                st.success(f"Executed query: **{len(result_df):,}** rows.")
                                 st.code(extracted_sql, language="sql")
                                 st.dataframe(df_preview, use_container_width=True)
                             except Exception as sql_err:
-                                st.warning(f"Could not run SQL from reply: {sql_err}")
-                                df_preview = work.head(500)
-                                st.dataframe(df_preview, use_container_width=True)
-                        else:
-                            df_preview = work.head(500)
-                            st.dataframe(df_preview, use_container_width=True)
+                                st.warning(f"Could not run SQL: {sql_err}")
+
+                    # ── No data: pure conversational ChatGPT-style ─────────
+                    else:
+                        # Build conversation history for context
+                        history_text = "\n".join(
+                            f"{m['role'].capitalize()}: {m['content']}"
+                            for m in st.session_state.messages[:-1]
+                            if m["role"] in ("user", "assistant")
+                        )
+                        free_prompt = (
+                            f"{history_text}\nUser: {ut}" if history_text else ut
+                        )
+                        with st.spinner("Thinking…"):
+                            assistant_content = call_ai_text_unified(
+                                free_prompt, ai_provider, gemini_api_key,
+                                gemini_model_name, ollama_base_url, ollama_model,
+                            )
+                        st.markdown(assistant_content or "")
+
                 except Exception as e:
                     st.error(str(e))
                     assistant_content = f"Error: {e}"
+
             st.session_state.messages.append(
                 {
                     "role": "assistant",
