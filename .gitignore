@@ -1,0 +1,28 @@
+# Secrets and local auth — never push real passwords
+app_auth_credentials.json
+*.json.key
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Data / uploads (if you add large files locally)
+*.csv
+*.xlsx
+*.parquet
