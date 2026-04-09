@@ -54,6 +54,11 @@ header[data-testid="stHeader"] {
     background-color: transparent !important;
     box-shadow: none !important;
 }
+/* Download button hidden for non-admin — overridden to visible for admin via inline style injected below */
+.no-download [data-testid="stElementToolbar"],
+.no-download [data-testid="stElementToolbarButton"],
+.no-download button[title="Download"],
+.no-download [aria-label="Download"] { display: none !important; }
 :root {
   --pnl-bg: #f1f5f9;
   --pnl-surface: #ffffff;
@@ -1121,6 +1126,84 @@ def _apikeys_delete(name: str) -> Tuple[bool, str]:
     return _apikeys_save(new_keys)
 
 
+# ── Apps Script URL vault ──────────────────────────────────────────────────────
+
+def _ascript_sources_load() -> List[dict]:
+    """Return list of {name, url, default_tab} dicts."""
+    path = _auth_credentials_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        sources = data.get("appscript_sources", [])
+        if isinstance(sources, list):
+            return [s for s in sources if isinstance(s, dict) and s.get("name") and s.get("url")]
+    except (OSError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def _ascript_sources_save(sources: List[dict]) -> Tuple[bool, str]:
+    path = _auth_credentials_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data["appscript_sources"] = sources
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True, ""
+    except OSError as e:
+        return False, str(e)
+
+
+def _ascript_sources_add(name: str, url: str, default_tab: str = "") -> Tuple[bool, str]:
+    name, url = name.strip(), url.strip()
+    if not name:
+        return False, "Give the source a name."
+    if not url:
+        return False, "Paste the Apps Script Web App URL."
+    sources = _ascript_sources_load()
+    if any(s["name"].lower() == name.lower() for s in sources):
+        return False, f'A source named "{name}" already exists.'
+    sources.append({"name": name, "url": url, "default_tab": default_tab.strip()})
+    return _ascript_sources_save(sources)
+
+
+def _ascript_sources_delete(name: str) -> Tuple[bool, str]:
+    sources = _ascript_sources_load()
+    new = [s for s in sources if s["name"] != name]
+    if len(new) == len(sources):
+        return False, "Source not found."
+    return _ascript_sources_save(new)
+
+
+def _ascript_set_tab_permissions(source_name: str, user_id: str, allowed_tabs: List[str]) -> Tuple[bool, str]:
+    """Set which tabs a specific user can see in a given source. Empty list = no access."""
+    sources = _ascript_sources_load()
+    for s in sources:
+        if s["name"] == source_name:
+            if "permissions" not in s or not isinstance(s["permissions"], dict):
+                s["permissions"] = {}
+            s["permissions"][user_id] = allowed_tabs
+            return _ascript_sources_save(sources)
+    return False, "Source not found."
+
+
+def _ascript_get_allowed_tabs(source: dict, user_id: str, is_admin: bool, all_tabs: List[str]) -> List[str]:
+    """Return the tabs a user is allowed to see. Admins always see all."""
+    if is_admin:
+        return all_tabs
+    perms = source.get("permissions", {})
+    # If no permissions set for this user, default = no access
+    if user_id not in perms:
+        return []
+    allowed = perms[user_id]
+    # Filter to only tabs that actually exist
+    return [t for t in allowed if t in all_tabs]
+
+
 def render_admin_panel() -> None:
     """Admin-only page: manage users, roles, and page access."""
     st.header("Admin Panel — User Management")
@@ -1280,6 +1363,118 @@ def render_admin_panel() -> None:
                 ok, msg = _apikeys_delete(del_key_name)
                 if ok:
                     st.success(f"Key **{del_key_name}** deleted.")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.divider()
+
+    # ── Apps Script Data Sources ──────────────────────────────────────────────
+    st.subheader("📄  Apps Script Data Sources")
+    st.caption(
+        "Save Apps Script Web App URLs here. Assign per-user tab access. "
+        "Users see only their permitted tabs — URL is never shown to non-admins."
+    )
+    _as_sources = _ascript_sources_load()
+
+    # ── Sources table ─────────────────────────────────────────────────────
+    if _as_sources:
+        as_tbl = ""
+        for s in _as_sources:
+            masked_url = s["url"][:45] + "…" if len(s["url"]) > 45 else s["url"]
+            perms = s.get("permissions", {})
+            perm_summary = ", ".join(
+                f"{html.escape(uid)}: [{', '.join(html.escape(t) for t in tabs)}]"
+                for uid, tabs in perms.items()
+            ) if perms else "<em>all users — no restrictions yet</em>"
+            as_tbl += (
+                f"<tr>"
+                f"<td style='padding:6px 10px;font-weight:600;'>{html.escape(s['name'])}</td>"
+                f"<td style='padding:6px 10px;font-family:monospace;color:#64748b;font-size:0.78rem;'>{html.escape(masked_url)}</td>"
+                f"<td style='padding:6px 10px;font-size:0.8rem;color:#475569;'>{perm_summary}</td>"
+                f"</tr>"
+            )
+        st.markdown(
+            f'<table style="width:100%;border-collapse:collapse;">'
+            f'<thead><tr>'
+            f'<th style="text-align:left;padding:6px 10px;border-bottom:1px solid #334155;">Source</th>'
+            f'<th style="text-align:left;padding:6px 10px;border-bottom:1px solid #334155;">URL</th>'
+            f'<th style="text-align:left;padding:6px 10px;border-bottom:1px solid #334155;">Tab permissions</th>'
+            f'</tr></thead><tbody>{as_tbl}</tbody></table>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("No Apps Script sources saved yet.")
+
+    # ── Add source ────────────────────────────────────────────────────────
+    with st.expander("➕  Add Apps Script source", expanded=False):
+        with st.form("admin_add_ascript_form", clear_on_submit=True):
+            as_name = st.text_input("Source name", placeholder="e.g. Sales Sheet")
+            as_url  = st.text_input("Web App URL", placeholder="https://script.google.com/macros/s/…/exec")
+            as_tab  = st.text_input("Default tab (optional)", placeholder="Sheet1")
+            if st.form_submit_button("Save source", type="primary"):
+                ok, msg = _ascript_sources_add(as_name, as_url, as_tab)
+                if ok:
+                    st.success(f"Source **{as_name}** saved.")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    # ── Tab permissions per user ──────────────────────────────────────────
+    if _as_sources:
+        with st.expander("🔐  Assign tab permissions to users", expanded=False):
+            st.caption(
+                "Select a source, fetch its tabs, then pick a user and choose which tabs they can see. "
+                "Admin users always see all tabs regardless."
+            )
+            _perm_src_name = st.selectbox(
+                "Source", [s["name"] for s in _as_sources], key="admin_perm_src_sel"
+            )
+            _perm_src = next((s for s in _as_sources if s["name"] == _perm_src_name), None)
+
+            _perm_tabs_key = f"admin_perm_tabs_{_perm_src_name}"
+            _perm_cached_tabs: List[str] = st.session_state.get(_perm_tabs_key, [])
+
+            if st.button("🔄 Fetch tabs from this source", key="admin_perm_fetch_tabs"):
+                try:
+                    with st.spinner("Fetching tabs…"):
+                        _fetched = _appscript_list_sheets(_perm_src["url"])
+                    st.session_state[_perm_tabs_key] = _fetched
+                    _perm_cached_tabs = _fetched
+                    st.success(f"Found {len(_fetched)} tab(s): {', '.join(_fetched)}")
+                except Exception as _pe:
+                    st.error(f"Could not fetch tabs: {_pe}")
+
+            if _perm_cached_tabs:
+                _all_users = [u["id"] for u in _load_auth_users() if u.get("role") != "admin"]
+                if not _all_users:
+                    st.info("No non-admin users found.")
+                else:
+                    _perm_user = st.selectbox("User to configure", _all_users, key="admin_perm_user_sel")
+                    _existing_tabs = (_perm_src or {}).get("permissions", {}).get(_perm_user, _perm_cached_tabs)
+                    _sel_tabs = st.multiselect(
+                        f"Tabs visible to **{_perm_user}**",
+                        options=_perm_cached_tabs,
+                        default=[t for t in _existing_tabs if t in _perm_cached_tabs],
+                        key="admin_perm_tabs_sel",
+                        help="Leave empty to block access entirely. Admin always sees all tabs.",
+                    )
+                    if st.button("💾 Save permissions", key="admin_perm_save_btn", type="primary"):
+                        ok, msg = _ascript_set_tab_permissions(_perm_src_name, _perm_user, _sel_tabs)
+                        if ok:
+                            st.success(f"Saved: **{_perm_user}** → {_sel_tabs or 'no access'}")
+                            st.rerun()
+                        else:
+                            st.error(msg)
+            else:
+                st.info("Click **Fetch tabs** above to load available tabs from the source.")
+
+        with st.expander("🗑  Delete an Apps Script source", expanded=False):
+            del_as_name = st.selectbox("Select source to delete", [s["name"] for s in _as_sources], key="admin_del_ascript_sel")
+            if st.button("Delete source", key="admin_del_ascript_btn", type="secondary"):
+                ok, msg = _ascript_sources_delete(del_as_name)
+                if ok:
+                    st.success(f"Source **{del_as_name}** deleted.")
                     st.rerun()
                 else:
                     st.error(msg)
@@ -1862,6 +2057,40 @@ def _gdrive_oauth_auth_url(client_id: str, client_secret: str, redirect_uri: str
     return "https://accounts.google.com/o/oauth2/v2/auth?" + _up.urlencode(params), state
 
 
+def _gdrive_oauth_save_app_creds(client_id: str, client_secret: str, redirect_uri: str) -> None:
+    """Persist OAuth2 app credentials so user doesn't re-enter them."""
+    path = _auth_credentials_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data["gdrive_oauth_app"] = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+def _gdrive_oauth_load_app_creds() -> dict:
+    """Load saved OAuth2 app credentials."""
+    path = _auth_credentials_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        c = data.get("gdrive_oauth_app", {})
+        if isinstance(c, dict):
+            return c
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
 def _gdrive_oauth_exchange_code(
     client_id: str, client_secret: str, redirect_uri: str, code: str
 ) -> dict:
@@ -1932,6 +2161,80 @@ def _gdrive_load_sheet_tab_oauth(token: str, file_id: str, sheet_title: str) -> 
     header, *data = rows
     n = len(header)
     return pd.DataFrame([r + [""] * (n - len(r)) for r in data], columns=header)
+
+
+# ── Apps Script data source ────────────────────────────────────────────────────
+
+_APPS_SCRIPT_CODE = '''\
+// ─────────────────────────────────────────────────────────────────
+// Paste this into your Google Sheet:
+//   Extensions → Apps Script → replace everything → Save → Deploy
+// Deploy settings:
+//   Execute as: Me   |   Who has access: Anyone
+// Copy the Web App URL and paste it into the app sidebar.
+// ─────────────────────────────────────────────────────────────────
+function doGet(e) {
+  var sheetName = (e && e.parameter && e.parameter.sheet) ? e.parameter.sheet : "";
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = sheetName ? ss.getSheetByName(sheetName) : ss.getSheets()[0];
+  if (!sheet) {
+    return ContentService
+      .createTextOutput(JSON.stringify({error: "Sheet not found: " + sheetName}))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var range = sheet.getDataRange();
+  var values = range.getValues();
+  if (values.length === 0) {
+    return ContentService
+      .createTextOutput(JSON.stringify({sheet: sheet.getName(), rows: [], count: 0}))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var headers = values[0].map(String);
+  var rows = [];
+  for (var i = 1; i < values.length; i++) {
+    var obj = {};
+    for (var j = 0; j < headers.length; j++) {
+      obj[headers[j]] = values[i][j];
+    }
+    rows.push(obj);
+  }
+  // List available sheet names in metadata
+  var sheetNames = ss.getSheets().map(function(s){ return s.getName(); });
+  return ContentService
+    .createTextOutput(JSON.stringify({
+      sheet: sheet.getName(),
+      sheets: sheetNames,
+      count: rows.length,
+      rows: rows
+    }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+'''
+
+
+def _appscript_fetch(web_app_url: str, sheet_name: str = "") -> pd.DataFrame:
+    """Fetch data from a Google Sheet via a deployed Apps Script Web App."""
+    url = web_app_url.strip()
+    if sheet_name:
+        url += ("&" if "?" in url else "?") + urllib.parse.quote_plus(f"sheet={sheet_name}", safe="=")
+    req = urlrequest.Request(url, headers={"User-Agent": "OperationsDashboard/1.0"})
+    with urlrequest.urlopen(req, timeout=30) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    if "error" in payload:
+        raise ValueError(payload["error"])
+    rows = payload.get("rows", [])
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def _appscript_list_sheets(web_app_url: str) -> List[str]:
+    """Return the list of sheet/tab names from the Apps Script endpoint."""
+    url = web_app_url.strip()
+    req = urlrequest.Request(url, headers={"User-Agent": "OperationsDashboard/1.0"})
+    with urlrequest.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload.get("sheets", [])
 
 
 def _gdrive_list_sheets(sa_info: dict) -> List[dict]:
@@ -5218,6 +5521,16 @@ if not st.session_state.auth_ok:
 st.markdown(_PNL_FULL_SITE_CSS, unsafe_allow_html=True)
 st.markdown(_build_theme_override_css(st.session_state.app_theme == "dark"), unsafe_allow_html=True)
 
+# Hide dataframe download toolbar for non-admin users
+if st.session_state.get("auth_role") != "admin":
+    st.markdown(
+        "<style>"
+        "[data-testid='stElementToolbar'] { display: none !important; }"
+        "button[title='Download'], [aria-label='Download'] { display: none !important; }"
+        "</style>",
+        unsafe_allow_html=True,
+    )
+
 # --- Sidebar: vertical nav layout (brand, search, nav items, AI, data, footer) ---
 if "main_view" not in st.session_state:
     st.session_state.main_view = "AI Chat"
@@ -5397,6 +5710,7 @@ db_type = st.sidebar.selectbox(
         "Upload CSV / Excel",
         "Google Sheet (CSV link)",
         "Google Drive (pick a Sheet)",
+        "Apps Script (Private Sheet)",
         "Other SQL (Postgres/MySQL)",
     ],
 )
@@ -6270,22 +6584,62 @@ elif db_type == "Google Drive (pick a Sheet)":
     _gd_sa_info: Optional[dict] = None
 
     if _gd_auth_method == "Google Account (OAuth2)":
-        # ── Step 1: credentials ─────────────────────────────────────────────
-        with st.sidebar.expander("OAuth2 App credentials", expanded=_gd_oauth_token is None):
-            st.caption(
-                "Create a **OAuth 2.0 Client ID** in Google Cloud Console → APIs & Services → Credentials. "
-                "Choose **Web application**, add `http://localhost:8501` (or your app URL) as an Authorized redirect URI."
-            )
-            _gd_client_id = st.text_input("Client ID", key=f"gdrive_cid_{_gd_tab}", placeholder="…apps.googleusercontent.com")
-            _gd_client_secret = st.text_input("Client Secret", key=f"gdrive_csec_{_gd_tab}", type="password")
-            _gd_redirect = st.text_input(
-                "Redirect URI (must match Cloud Console)",
-                value="http://localhost:8501",
-                key=f"gdrive_redir_{_gd_tab}",
-            )
+
+        # Load saved app credentials so user doesn't re-enter each time
+        _saved_oauth_app = _gdrive_oauth_load_app_creds()
+
+        if not _gd_oauth_token:
+            with st.sidebar.expander("⚙️ Setup (one-time only)", expanded=not bool(_saved_oauth_app)):
+                st.markdown(
+                    "**One-time Google Cloud setup:**\n"
+                    "1. Go to [console.cloud.google.com](https://console.cloud.google.com)\n"
+                    "2. Create a project (or pick existing)\n"
+                    "3. Enable **Google Drive API** + **Google Sheets API**\n"
+                    "4. Go to **APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client ID**\n"
+                    "5. Choose **Web application**\n"
+                    "6. Under *Authorized redirect URIs* add: `http://localhost:8501`\n"
+                    "7. Copy the **Client ID** and **Client Secret** below and click Save"
+                )
+                _gd_client_id = st.text_input(
+                    "Client ID",
+                    value=_saved_oauth_app.get("client_id", ""),
+                    key=f"gdrive_cid_{_gd_tab}",
+                    placeholder="xxxx.apps.googleusercontent.com",
+                )
+                _gd_client_secret = st.text_input(
+                    "Client Secret",
+                    value=_saved_oauth_app.get("client_secret", ""),
+                    key=f"gdrive_csec_{_gd_tab}",
+                    type="password",
+                )
+                _gd_redirect = st.text_input(
+                    "Redirect URI",
+                    value=_saved_oauth_app.get("redirect_uri", "http://localhost:8501"),
+                    key=f"gdrive_redir_{_gd_tab}",
+                    help="Must exactly match what you added in Google Cloud Console.",
+                )
+                if st.button("💾 Save setup", key=f"gdrive_save_creds_{_gd_tab}", use_container_width=True):
+                    if _gd_client_id and _gd_client_secret:
+                        _gdrive_oauth_save_app_creds(_gd_client_id, _gd_client_secret, _gd_redirect)
+                        st.success("Saved! Now click Sign in with Google below.")
+                        st.rerun()
+                    else:
+                        st.error("Enter Client ID and Client Secret first.")
+        else:
+            _gd_client_id = _saved_oauth_app.get("client_id", "")
+            _gd_client_secret = _saved_oauth_app.get("client_secret", "")
+            _gd_redirect = _saved_oauth_app.get("redirect_uri", "http://localhost:8501")
+
+        # Use saved creds if not overridden above
+        if not locals().get("_gd_client_id"):
+            _gd_client_id = _saved_oauth_app.get("client_id", "")
+        if not locals().get("_gd_client_secret"):
+            _gd_client_secret = _saved_oauth_app.get("client_secret", "")
+        if not locals().get("_gd_redirect"):
+            _gd_redirect = _saved_oauth_app.get("redirect_uri", "http://localhost:8501")
 
         if _gd_client_id and _gd_client_secret:
-            # ── Step 2: if we got a code back in URL params, exchange it ────
+            # Handle OAuth callback code in URL
             _qp = st.query_params
             _oauth_code = _qp.get("code", "")
             _oauth_state = _qp.get("state", "")
@@ -6293,34 +6647,35 @@ elif db_type == "Google Drive (pick a Sheet)":
             if _oauth_code and (not _expected_state or _oauth_state == _expected_state):
                 if not _gd_oauth_token:
                     try:
-                        with st.spinner("Exchanging code for token…"):
+                        with st.spinner("Connecting to Google…"):
                             _tok = _gdrive_oauth_exchange_code(
                                 _gd_client_id, _gd_client_secret, _gd_redirect, _oauth_code
                             )
                         _gd_oauth_token = _tok.get("access_token", "")
                         st.session_state[f"gdrive_oauth_token_{_gd_tab}"] = _gd_oauth_token
-                        # Clear the code from URL
                         st.query_params.clear()
-                        st.sidebar.success("Google account connected!")
+                        st.sidebar.success("✅ Google account connected!")
                         st.rerun()
                     except Exception as _oe:
-                        st.sidebar.error(f"Token exchange failed: {_oe}")
+                        st.sidebar.error(f"Sign-in failed: {_oe}")
 
             if not _gd_oauth_token:
-                # ── Step 3: show the login button ───────────────────────────
                 _auth_url, _state = _gdrive_oauth_auth_url(_gd_client_id, _gd_client_secret, _gd_redirect)
                 st.session_state[f"gdrive_oauth_state_{_gd_tab}"] = _state
                 st.sidebar.link_button(
                     "🔑  Sign in with Google",
                     _auth_url,
                     use_container_width=True,
+                    type="primary",
                 )
-                st.sidebar.caption("Click above → allow access → you'll be redirected back here automatically.")
+                st.sidebar.caption("Opens Google sign-in → approve access → returns here automatically.")
             else:
-                st.sidebar.success("✅ Google account connected")
-                if st.sidebar.button("Disconnect", key=f"btn_gdrive_disco_{_gd_tab}"):
+                st.sidebar.success("✅ Signed in with Google")
+                if st.sidebar.button("🔓 Disconnect", key=f"btn_gdrive_disco_{_gd_tab}"):
                     st.session_state.pop(f"gdrive_oauth_token_{_gd_tab}", None)
                     st.rerun()
+        else:
+            st.sidebar.info("Complete the ⚙️ Setup above first.")
 
     else:
         # ── Service Account JSON path ────────────────────────────────────────
@@ -6447,6 +6802,140 @@ elif db_type == "Google Drive (pick a Sheet)":
             )
         else:
             st.info("Upload a service-account JSON, list sheets, pick one, select a tab, and click **Load**.")
+
+elif db_type == "Apps Script (Private Sheet)":
+    st.sidebar.caption(f"Fetches into the **{main_view}** tab.")
+    _as_k = _tab_suf(main_view)
+    _as_saved_sources = _ascript_sources_load()
+
+    if _is_admin:
+        # ── ADMIN: full configuration panel ──────────────────────────────
+        with st.sidebar.expander("📋 How to set up (one time)", expanded=False):
+            st.markdown(
+                "1. Open your Google Sheet\n"
+                "2. **Extensions → Apps Script**\n"
+                "3. Paste the script shown on the main screen\n"
+                "4. **Deploy → New deployment** → Web app\n"
+                "   - Execute as: **Me** | Who has access: **Anyone**\n"
+                "5. Copy the Web App URL\n"
+                "6. Save it in **Admin → 📄 Apps Script Data Sources** with a name\n"
+                "   — users will only see the name, never the URL"
+            )
+
+        # Admin can pick a saved source OR paste a URL directly
+        _as_url = ""
+        if _as_saved_sources:
+            _admin_src_options = ["— paste URL directly —"] + [s["name"] for s in _as_saved_sources]
+            _admin_src_sel = st.sidebar.selectbox("Saved source", _admin_src_options, key=f"as_admin_sel_{_as_k}")
+            if _admin_src_sel != "— paste URL directly —":
+                _matched_src = next((s for s in _as_saved_sources if s["name"] == _admin_src_sel), None)
+                if _matched_src:
+                    _as_url = _matched_src["url"]
+
+        if not _as_url:
+            _as_url = st.sidebar.text_input(
+                "Web App URL (admin only)",
+                key=f"appscript_url_{_as_k}",
+                placeholder="https://script.google.com/macros/s/…/exec",
+            )
+
+        _as_sheets: List[str] = st.session_state.get(f"appscript_sheets_{_as_k}", [])
+        if _as_url:
+            if st.sidebar.button("🔄 List tabs", key=f"btn_as_list_{_as_k}", use_container_width=True):
+                try:
+                    with st.spinner("Connecting…"):
+                        _as_sheets = _appscript_list_sheets(_as_url)
+                    st.session_state[f"appscript_sheets_{_as_k}"] = _as_sheets
+                except Exception as _ae:
+                    st.sidebar.error(f"Error: {_ae}")
+            if _as_sheets:
+                _as_tab = st.sidebar.selectbox("Tab", _as_sheets, key=f"appscript_tab_{_as_k}")
+                if st.sidebar.button("⬇️ Load data", key=f"btn_as_load_{_as_k}", use_container_width=True):
+                    try:
+                        with st.spinner(f"Loading '{_as_tab}'…"):
+                            _as_df = _appscript_fetch(_as_url, _as_tab)
+                        if _as_df.empty:
+                            st.sidebar.warning("Sheet appears empty.")
+                        else:
+                            st.session_state[_k_last(main_view)] = _as_df
+                            st.session_state[_k_upload_orig(main_view)] = _as_df.copy()
+                            st.session_state[_k_sample(main_view)] = _as_df
+                            st.session_state[_k_sample_raw(main_view)] = _as_df.copy()
+                            st.session_state[_k_file_label(main_view)] = f"{_admin_src_sel if _admin_src_sel != '— paste URL directly —' else 'Apps Script'} › {_as_tab}"
+                            st.sidebar.success(f"Loaded **{len(_as_df):,}** rows")
+                    except Exception as _ae:
+                        st.sidebar.error(f"Load failed: {_ae}")
+
+    else:
+        # ── REGULAR USER: only sees saved sources by name, no URLs ───────
+        _cur_user_id = st.session_state.get("auth_user", "")
+        if not _as_saved_sources:
+            st.sidebar.warning("No data sources available. Ask your admin to add one.")
+        else:
+            _user_src_names = [s["name"] for s in _as_saved_sources]
+            _user_src_sel = st.sidebar.selectbox("Data source", _user_src_names, key=f"as_user_sel_{_as_k}")
+            _user_src = next((s for s in _as_saved_sources if s["name"] == _user_src_sel), None)
+            _as_url = _user_src["url"] if _user_src else ""
+            _as_sheets_u: List[str] = st.session_state.get(f"appscript_sheets_{_as_k}", [])
+
+            if _as_url:
+                if st.sidebar.button("🔄 List tabs", key=f"btn_as_list_u_{_as_k}", use_container_width=True):
+                    try:
+                        with st.spinner("Connecting…"):
+                            _all_tabs_u = _appscript_list_sheets(_as_url)
+                        # Filter to only permitted tabs for this user
+                        _allowed_u = _ascript_get_allowed_tabs(
+                            _user_src, _cur_user_id, False, _all_tabs_u
+                        )
+                        st.session_state[f"appscript_sheets_{_as_k}"] = _allowed_u
+                        _as_sheets_u = _allowed_u
+                        if not _allowed_u:
+                            st.sidebar.warning("You don't have access to any tab in this source. Contact admin.")
+                    except Exception as _ae:
+                        st.sidebar.error(f"Error: {_ae}")
+
+                if _as_sheets_u:
+                    _as_tab_u = st.sidebar.selectbox("Tab", _as_sheets_u, key=f"appscript_tab_u_{_as_k}")
+                    if st.sidebar.button("⬇️ Load data", key=f"btn_as_load_u_{_as_k}", use_container_width=True, type="primary"):
+                        try:
+                            with st.spinner("Loading…"):
+                                _as_df_u = _appscript_fetch(_as_url, _as_tab_u)
+                            if _as_df_u.empty:
+                                st.sidebar.warning("Sheet appears empty.")
+                            else:
+                                st.session_state[_k_last(main_view)] = _as_df_u
+                                st.session_state[_k_upload_orig(main_view)] = _as_df_u.copy()
+                                st.session_state[_k_sample(main_view)] = _as_df_u
+                                st.session_state[_k_sample_raw(main_view)] = _as_df_u.copy()
+                                st.session_state[_k_file_label(main_view)] = f"{_user_src_sel} › {_as_tab_u}"
+                                st.sidebar.success(f"Loaded **{len(_as_df_u):,}** rows")
+                        except Exception as _ae:
+                            st.sidebar.error(f"Load failed: {_ae}")
+
+    # ── Main area ─────────────────────────────────────────────────────────
+    if main_view in ("Dashboard", "PNL", "AI Chat"):
+        _as_loaded = st.session_state.get(_k_last(main_view))
+        if _as_loaded is None or (isinstance(_as_loaded, pd.DataFrame) and _as_loaded.empty):
+            if _is_admin:
+                st.info("👈 Select a saved source or paste a URL in the sidebar, list tabs and load data.")
+                st.subheader("📋 Apps Script code — paste this into your Google Sheet")
+                st.code(_APPS_SCRIPT_CODE, language="javascript")
+            else:
+                st.info("👈 Select a data source and click **Load data** in the sidebar.")
+        else:
+            if main_view == "Dashboard":
+                render_dashboard_tab(db_type, _as_loaded, ai_provider=ai_provider,
+                    gemini_api_key=gemini_api_key, gemini_model_name=gemini_model_name,
+                    ollama_base_url=ollama_base_url, ollama_model=ollama_model)
+            elif main_view == "PNL":
+                render_pnl_tab(db_type, _as_loaded, ai_provider=ai_provider,
+                    gemini_api_key=gemini_api_key, gemini_model_name=gemini_model_name,
+                    ollama_base_url=ollama_base_url, ollama_model=ollama_model)
+            elif main_view == "AI Chat":
+                render_loaded_data_panel(_as_loaded, key_prefix="appscript",
+                    ai_provider=ai_provider, gemini_api_key=gemini_api_key,
+                    gemini_model_name=gemini_model_name, ollama_base_url=ollama_base_url,
+                    ollama_model=ollama_model)
 
 elif db_type == "Other SQL (Postgres/MySQL)":
     st.sidebar.caption(f"Fetch applies to the **{main_view}** tab only.")
