@@ -2212,14 +2212,52 @@ function doGet(e) {
 '''
 
 
+def _appscript_call(web_app_url: str, sheet_name: str = "") -> dict:
+    """
+    Core HTTP call to an Apps Script Web App.
+    Handles redirects, empty responses, and HTML login pages with clear errors.
+    """
+    url = web_app_url.strip().rstrip("/")
+    if sheet_name:
+        # Use quote() not quote_plus() so spaces become %20, not +
+        sep = "&" if "?" in url else "?"
+        url = url + sep + "sheet=" + urllib.parse.quote(sheet_name, safe="")
+
+    req = urlrequest.Request(
+        url,
+        headers={
+            # A browser-like UA helps avoid Google's bot-detection redirects
+            "User-Agent": "Mozilla/5.0 (compatible; OperationsDashboard/1.0)",
+            "Accept": "application/json, text/plain, */*",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8").strip()
+    except Exception as e:
+        raise ValueError(f"Network error reaching Apps Script: {e}")
+
+    if not raw:
+        raise ValueError(
+            "Empty response from Apps Script.\n"
+            "Check the deployment: Deploy → Manage deployments → "
+            "Execute as: **Me** and Who has access: **Anyone**."
+        )
+    if raw.lstrip().startswith("<"):
+        raise ValueError(
+            "Got an HTML page instead of JSON — Google is asking for login.\n"
+            "Re-deploy the script: Who has access must be **Anyone** (not 'Anyone with Google account')."
+        )
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        snippet = raw[:200]
+        raise ValueError(f"Invalid JSON from Apps Script ({e}). Response start: {snippet!r}")
+
+
 def _appscript_fetch(web_app_url: str, sheet_name: str = "") -> pd.DataFrame:
     """Fetch data from a Google Sheet via a deployed Apps Script Web App."""
-    url = web_app_url.strip()
-    if sheet_name:
-        url += ("&" if "?" in url else "?") + urllib.parse.quote_plus(f"sheet={sheet_name}", safe="=")
-    req = urlrequest.Request(url, headers={"User-Agent": "OperationsDashboard/1.0"})
-    with urlrequest.urlopen(req, timeout=30) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+    payload = _appscript_call(web_app_url, sheet_name)
     if "error" in payload:
         raise ValueError(payload["error"])
     rows = payload.get("rows", [])
@@ -2230,11 +2268,14 @@ def _appscript_fetch(web_app_url: str, sheet_name: str = "") -> pd.DataFrame:
 
 def _appscript_list_sheets(web_app_url: str) -> List[str]:
     """Return the list of sheet/tab names from the Apps Script endpoint."""
-    url = web_app_url.strip()
-    req = urlrequest.Request(url, headers={"User-Agent": "OperationsDashboard/1.0"})
-    with urlrequest.urlopen(req, timeout=15) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    return payload.get("sheets", [])
+    payload = _appscript_call(web_app_url)
+    sheets = payload.get("sheets", [])
+    if not sheets:
+        raise ValueError(
+            "No sheet names returned. Make sure the Apps Script code is the latest version "
+            "(it should return a 'sheets' field listing all tab names)."
+        )
+    return sheets
 
 
 def _gdrive_list_sheets(sa_info: dict) -> List[dict]:
